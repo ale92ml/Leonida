@@ -599,6 +599,125 @@ class SoundnessRegressions(unittest.TestCase):
         self.assertIn("stale-scalar", reasons, full)
         self.assertNotEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)), full)
 
+    def test_a_vote_region_that_widens_exec_and_works_again_is_tier_c(self):
+        """A soundness bug the vote rule had from the start, found by `tools/wave64_halves_diff.py`: it checked
+        how the run side narrows EXEC and never that EXEC stays narrowed. A region that puts EXEC back and then
+        does per-lane work runs it in the wave for the lanes of a half that voted no and skipped the whole side,
+        and the words differ. `Analysis.exec_stays_inside` is the must-dataflow that closes it."""
+        work = "v_xor_b32_e32 v7, v0, v7"
+        for name, run in (
+                ("mov_launch", ["s_and_b64 exec, exec, s[20:21]", "v_mul_u32_u24_e32 v6, 3, v0",
+                                "s_mov_b64 exec, s[10:11]", work]),
+                ("or_launch", ["s_and_b64 exec, exec, s[20:21]", "v_mul_u32_u24_e32 v6, 3, v0",
+                               "s_or_b64 exec, exec, s[10:11]", work]),
+                # the saveexec destination holds the EXEC from before the narrowing, so restoring it widens
+                ("saveexec_restore", ["s_and_saveexec_b64 s[30:31], s[20:21]", "v_mul_u32_u24_e32 v6, 3, v0",
+                                      "s_or_b64 exec, exec, s[30:31]", work]),
+                ("not_exec", ["s_and_b64 exec, exec, s[20:21]", "v_mul_u32_u24_e32 v6, 3, v0",
+                              "s_not_b64 exec, exec", work]),
+                ("store_after_widen", ["s_and_b64 exec, exec, s[20:21]", "s_mov_b64 exec, s[10:11]",
+                                       "global_store_dword v0, v6, s[4:5]"]),
+        ):
+            with self.subTest(case=name):
+                full = f"vs_vote_widen_{name}"
+                body = ["v_cmp_gt_u32_e32 vcc, 32, v0", "s_and_b64 s[20:21], vcc, exec",
+                        f"s_cbranch_scc0 {sum(size(t) for t in run + ['s_mov_b64 exec, s[10:11]']) // 4}"] + \
+                    run + ["s_mov_b64 exec, s[10:11]"]
+                (tier, reasons, _), asm = meta_of(full, vs(body))
+                self.assertEqual(tier, "C", f"{full}: got {tier}, reasons={reasons}")
+                self.assertIn("unsafe-vote-branch", reasons, full)
+                if name != "store_after_widen":
+                    self.assertNotEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)),
+                                        f"{full}: expected the two cuts to diverge")
+
+    def test_a_vote_region_may_put_exec_back_at_its_end(self):
+        """The control for the rule above: restoring EXEC is the usual LLVM end-of-if and stays tier A as long as
+        nothing observable follows it before the join, because at the join both runs have those lanes on."""
+        for name, run in (
+                ("or_saveexec_last", ["s_and_saveexec_b64 s[30:31], s[20:21]", "v_mul_u32_u24_e32 v6, 3, v0",
+                                      "s_or_b64 exec, exec, s[30:31]"]),
+                ("mov_launch_last", ["s_and_b64 exec, exec, s[20:21]", "v_mul_u32_u24_e32 v6, 3, v0",
+                                     "s_mov_b64 exec, s[10:11]"]),
+                ("renarrow", ["s_and_b64 exec, exec, s[20:21]", "v_mul_u32_u24_e32 v6, 3, v0",
+                              "s_and_b64 exec, exec, s[20:21]", "v_xor_b32_e32 v7, v0, v7"]),
+        ):
+            with self.subTest(case=name):
+                full = f"vs_vote_restore_{name}"
+                body = ["v_cmp_gt_u32_e32 vcc, 32, v0", "s_and_b64 s[20:21], vcc, exec",
+                        f"s_cbranch_scc0 {sum(size(t) for t in run + ['s_mov_b64 exec, s[10:11]']) // 4}"] + \
+                    run + ["s_mov_b64 exec, s[10:11]"]
+                (tier, reasons, _), asm = meta_of(full, vs(body))
+                self.assertEqual(tier, "A", f"{full}: got {tier}, reasons={reasons}")
+                self.assertEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)), full)
+
+    # -- per-lane arithmetic before the narrowing, allowed only into VGPRs that are dead at the join
+    DEAD_COPY = "s_mov_b64 s[22:23], s[20:21]"
+
+    def test_dead_per_lane_arithmetic_before_the_narrowing_stays_tier_a(self):
+        """The wave runs the prefix with the lanes of a half that votes no still on, and that half skips it, so a
+        VGPR written there differs between the two runs - unless nobody reads it again. v20 and v21 are written
+        and never read, so each case is tier A and gives the same words at 64 lanes and at two waves of 32. The
+        carry-out case also writes an SGPR pair, which the `stale` check covers on its own."""
+        for name, prefix, work in (
+                ("mov", ["v_mov_b32_e32 v20, 7"], None),
+                ("arith", ["v_add_nc_u32_e32 v21, 3, v0"], None),
+                ("chain", ["v_mov_b32_e32 v20, 7", "v_xor_b32_e32 v21, v20, v0"], None),
+                ("with_scalar", ["v_mov_b32_e32 v20, 7", "s_add_u32 s26, s26, 1"], None),
+                ("carry_out", ["v_add_co_u32_e64 v20, s[24:25], v0, v0"], None),
+                # dead at the join even though the region itself writes and reads it again
+                ("rewritten_inside", ["v_mov_b32_e32 v20, 7"],
+                 ("v_mov_b32_e32 v20, 9", "v_add_nc_u32_e32 v6, v20, v6")),
+        ):
+            with self.subTest(case=name):
+                full = f"vs_vote_dead_{name}"
+                kwargs = {"work": work} if work else {}
+                (tier, reasons, _), asm = self.vote_skip(full, prefix + [self.DEAD_COPY], **kwargs)
+                self.assertEqual(tier, "A", f"{full}: got {tier}, reasons={reasons}")
+                self.assertEqual(reasons, [], full)
+                self.assertEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)), full)
+
+    def test_a_vgpr_that_is_read_again_keeps_the_vote_tier_c(self):
+        """Every way the written VGPR can still be observed: it leaves through the export, it is read past the
+        join, a cross-lane read reaches it even while those lanes are masked off, or the instruction is not plain
+        per-lane arithmetic at all. `readlane_after` is tier C and its 32-lane run is undefined rather than
+        merely different - a shuffle from lane 40 of a 32-wide subgroup - which is exactly what the tier is for."""
+        for name, prefix, after, diverges in (
+                ("live_exported", ["v_mov_b32_e32 v6, 7"], (), True),
+                ("read_after_join", ["v_mov_b32_e32 v20, 7"], ("v_add_nc_u32_e32 v7, v20, v7",), True),
+                ("readlane_after", ["v_mov_b32_e32 v20, 7"],
+                 ("v_readlane_b32 s27, v20, 40", "v_add_nc_u32_e32 v7, s27, v7"), False),
+                ("bpermute_after", ["v_mov_b32_e32 v20, 7"],
+                 ("v_lshlrev_b32_e32 v22, 2, v0", "ds_bpermute_b32 v23, v22, v20",
+                  "v_add_nc_u32_e32 v7, v23, v7"), True),
+                ("writelane", ["v_writelane_b32 v20, s10, 45"], (), False),
+                ("dpp", ["v_mov_b32_dpp v20, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"], (), False),
+                ("cmpx", ["v_cmpx_gt_u32_e32 8, v0"], (), False),
+                ("store", ["global_store_dword v0, v6, s[4:5]"], (), False),
+                ("buffer_load", ["buffer_load_dword v20, v0, s[0:3], 0 offen"], (), False),
+                # a 16-bit result keeps the other half of the destination, so it reads v6 as well as writes it
+                ("partial_live", ["v_add_f16_e32 v6, v0, v6"], (), None),
+        ):
+            with self.subTest(case=name):
+                full = f"vs_vote_live_{name}"
+                (tier, reasons, _), asm = self.vote_skip(full, prefix + [self.DEAD_COPY], after=after)
+                self.assertEqual(tier, "C", f"{full}: got {tier}, reasons={reasons}")
+                if diverges:
+                    self.assertNotEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)),
+                                        f"{full}: expected the two cuts to diverge")
+
+    def test_the_same_program_flips_on_one_read_past_the_join(self):
+        """The pair that shows the liveness is load-bearing and not a formality: one program, one extra
+        instruction after the join, tier A and invariant becomes tier C and divergent."""
+        prefix = ["v_mov_b32_e32 v20, 7", self.DEAD_COPY]
+        (tier_a, reasons_a, _), asm_a = self.vote_skip("vs_vote_flip_dead", prefix)
+        (tier_c, reasons_c, _), asm_c = self.vote_skip("vs_vote_flip_live", prefix,
+                                                       after=["v_add_nc_u32_e32 v7, v20, v7"])
+        self.assertEqual((tier_a, reasons_a), ("A", []))
+        self.assertEqual(tier_c, "C", f"reasons={reasons_c}")
+        self.assertIn("unsafe-vote-branch", reasons_c)
+        self.assertEqual(out_param(run_cut(asm_a, 64)), out_param(run_cut(asm_a, 32)))
+        self.assertNotEqual(out_param(run_cut(asm_c, 64)), out_param(run_cut(asm_c, 32)))
+
     def test_a_prefix_scalar_of_a_vote_inside_a_loop_is_stale(self):
         """The same check with the vote in a loop, where a half can vote yes on one trip and no on the next, so
         the wave adds to the scalar once more than the half does: the loop's back edge is the second reaching

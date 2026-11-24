@@ -114,11 +114,21 @@ class Harness(unittest.TestCase):
         """A batch that is all tier C proves nothing: the oracle only bites on tier A or B. The flow and kill
         modes reach tier A, and the idiom modes are the ones that reach tier B at all - cf_diff emits no
         cross-lane instruction, so without the fragments the one tier that needs a rewrite is never generated."""
-        for mode, want in (("flow", "A"), ("kill", "A"), ("idioms", "B"),
-                           ("ps", "A"), ("ps_kill", "A"), ("ps_idioms", "B")):
+        for mode, want in (("flow", "A"), ("kill", "A"), ("idioms", "B"), ("vote", "A"),
+                           ("ps", "A"), ("ps_kill", "A"), ("ps_idioms", "B"), ("ps_vote", "A")):
             with self.subTest(mode=mode):
                 tiers = [diff.check(mode, 2, i, 3).get("tier") for i in range(14)]
                 self.assertIn(want, tiers, f"{mode}: no tier {want} in {tiers}")
+
+    def test_the_vote_mode_straddles_the_rule_it_probes(self):
+        """The vote mode exists to sit on the boundary of Analysis.narrows, so a batch has to land on both sides
+        of it: a batch that is all tier A would mean the mutations never break the rule, and one that is all
+        tier C would mean they always do, and neither tells anything about the rule."""
+        for mode in ("vote", "ps_vote"):
+            with self.subTest(mode=mode):
+                tiers = [diff.check(mode, 7, i, 3).get("tier") for i in range(16)]
+                self.assertGreaterEqual(tiers.count("A"), 4, f"{mode}: too few accepted prefixes in {tiers}")
+                self.assertGreaterEqual(tiers.count("C"), 4, f"{mode}: too few rejected prefixes in {tiers}")
 
     def test_a_pixel_program_shades_the_pixels_its_lane_covers(self):
         """The pixel frame has to put the same pixel in the same lane in both cuts, or every pixel-mode result
@@ -139,7 +149,7 @@ class Harness(unittest.TestCase):
     def test_a_small_fixed_seed_batch_has_no_tier_a_or_b_divergence(self):
         for mode in diff.MODES:
             with self.subTest(mode=mode):
-                counts = diff.summarise(diff.run_batch(mode, 4, 4, 3))
+                counts = diff.summarise(diff.run_batch(mode, 4, 3, 3))
                 self.assertGreater(counts["compared"], 0, f"{mode}: nothing was compared")
                 self.assertEqual(counts["unsound"], 0, f"{mode}: a tier A/B program diverged")
 

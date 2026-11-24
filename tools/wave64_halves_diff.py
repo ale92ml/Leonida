@@ -27,6 +27,9 @@ The six modes, three per stage:
                            permlane, so without them the one tier that needs a rewrite never appears
     kill / ps_kill         one or two mutations of the pixel-kill shape the test suite asserts is tier A, so
                            samples land on the boundary of kill_vote / inert_exit / confined / vm_export_before
+    vote / ps_vote         mutations of a vote whose run side computes the mask before narrowing EXEC, the
+                           boundary of Analysis.narrows: which prefixes a half that votes no cannot notice, and
+                           which VGPR written there is dead where the two runs meet again
 
 The pixel modes matter out of proportion to their number: 12,101 of the corpus's 13,405 wave64 graphics shaders
 are pixel shaders and 8,585 of its 9,287 tier C, and the quad rules, the helper lanes and the `exp ... vm` that
@@ -66,8 +69,8 @@ for _p in (HERE, SEM_DIR):
 import cf_diff  # noqa: E402
 from spirv_wave_interp import UnsupportedConstruct, run_wave  # noqa: E402
 
-MODES = ("flow", "idioms", "kill", "ps", "ps_idioms", "ps_kill")
-PS_MODES = ("ps", "ps_idioms", "ps_kill")
+MODES = ("flow", "idioms", "kill", "vote", "ps", "ps_idioms", "ps_kill", "ps_vote")
+PS_MODES = ("ps", "ps_idioms", "ps_kill", "ps_vote")
 
 # A pixel shader's per-lane value is the pixel it covers, not a lane id: interpolate attribute 0, scale it by the
 # 64x64 target of the ps_w64_* fixtures and pack it as p = y * 64 + x, the same number
@@ -364,12 +367,105 @@ def run_cut_ps(spv, wave):
     return out
 
 
+# ---- a vote whose run side computes the mask before narrowing EXEC ------------------------------------------
+# The boundary of Analysis.narrows: what may run on the run side before the narrowing. A half that votes no skips
+# the side entirely, so the prefix has to be something it cannot notice - a scalar (the `stale` check covers a
+# later read) or per-lane arithmetic into a VGPR that is dead where the two runs meet. The mask holds lanes 0..31,
+# so the upper half always votes no and always skips.
+VOTE_PREFIX = "s_mov_b64 s[22:23], s[20:21]"
+VOTE_NARROW = "s_and_b64 exec, exec, s[22:23]"
+
+
+def vote_base():
+    return {"head": ["v_cmp_gt_u32_e32 vcc, 32, v0", "s_and_b64 s[20:21], vcc, exec"],
+            "vote": "s_cbranch_scc0",
+            "prefix": [VOTE_PREFIX],
+            "narrow": VOTE_NARROW,
+            "work": ["v_mul_u32_u24_e32 v6, 3, v0"],
+            "after": []}
+
+
+VOTE_MUTATIONS = [
+    # how the mask the narrowing uses is derived: a copy or an intersection stays inside the voted mask, a union,
+    # a complement, whole quads or another compare do not
+    ("derive_and_launch", _set("prefix", 0, "s_and_b64 s[22:23], s[20:21], s[10:11]")),
+    ("derive_andn2", _set("prefix", 0, "s_andn2_b64 s[22:23], s[20:21], vcc")),
+    ("derive_wqm", _set("prefix", 0, "s_wqm_b64 s[22:23], s[20:21]")),
+    ("derive_union", _set("prefix", 0, "s_or_b64 s[22:23], s[20:21], s[10:11]")),
+    ("derive_not", _set("prefix", 0, "s_not_b64 s[22:23], s[20:21]")),
+    ("derive_other_cmp", _put("prefix", ["v_cmp_gt_u32_e32 vcc, 48, v0", "s_mov_b64 s[22:23], vcc"])),
+    ("derive_none", _put("prefix", [])),
+    ("narrow_voted_mask", lambda p, r: p.__setitem__("narrow", "s_and_b64 exec, exec, s[20:21]")),
+    # per-lane arithmetic in the prefix: v20 and v21 are read nowhere, v6 and v7 leave through the export
+    ("dead_vgpr", _insert("prefix", 0, "v_mov_b32_e32 v20, 7")),
+    ("dead_vgpr_arith", _insert("prefix", 0, "v_add_nc_u32_e32 v21, 3, v0")),
+    ("dead_vgpr_chain", lambda p, r: p["prefix"].__setitem__(
+        slice(0, 0), ["v_mov_b32_e32 v20, 7", "v_xor_b32_e32 v21, v20, v0"])),
+    ("live_vgpr", _insert("prefix", 0, "v_mul_u32_u24_e32 v6, 5, v0")),
+    ("live_vgpr_input", _insert("prefix", 0, "v_mov_b32_e32 v0, 7")),
+    # prefixes that must end the search
+    ("writelane", _insert("prefix", 0, "v_writelane_b32 v20, s10, 45")),
+    ("dpp", _insert("prefix", 0, "v_mov_b32_dpp v20, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf")),
+    ("cmpx", _insert("prefix", 0, "v_cmpx_gt_u32_e32 8, v0")),
+    ("store", _insert("prefix", 0, "global_store_dword v0, v6, s[4:5]")),
+    ("exec_widen", _insert("prefix", 0, "s_or_b64 exec, exec, s[10:11]")),
+    ("mask_rewrite", _insert("prefix", 0, "s_mov_b64 s[20:21], exec")),
+    ("mask_half", _insert("prefix", 0, "s_mov_b32 s22, s20")),
+    ("scalar", _insert("prefix", 0, "s_add_u32 s26, s26, 1")),
+    ("scalar_bcnt", _insert("prefix", 0, "s_bcnt1_i32_b64 s27, s[20:21]")),
+    # what the narrowing itself is
+    ("narrow_saveexec", lambda p, r: p.__setitem__("narrow", "s_and_saveexec_b64 s[30:31], s[22:23]")),
+    ("narrow_mov_exec", lambda p, r: p.__setitem__("narrow", "s_mov_b64 exec, s[22:23]")),
+    ("narrow_andn2_saveexec", lambda p, r: p.__setitem__("narrow", "s_andn2_saveexec_b64 s[30:31], vcc")),
+    ("narrow_or_saveexec", lambda p, r: p.__setitem__("narrow", "s_or_saveexec_b64 s[30:31], s[22:23]")),
+    # the head and the vote
+    ("head_andn2", _set("head", 1, "s_andn2_b64 s[20:21], exec, vcc")),
+    ("head_cmp_lg", _append("head", "s_cmp_lg_u64 s[20:21], 0")),
+    ("head_redef", _append("head", "s_mov_b64 s[20:21], exec")),
+    ("head_threshold", lambda p, r: p["head"].__setitem__(
+        0, f"v_cmp_gt_u32_e32 vcc, {r.choice((8, 24, 40, 56))}, v0")),
+    ("vote_scc1", _put("vote", "s_cbranch_scc1")),
+    ("vote_vccz", _put("vote", "s_cbranch_vccz")),
+    ("vote_vccnz", _put("vote", "s_cbranch_vccnz")),
+    # what happens after the join, which is what decides whether a prefix VGPR was dead
+    ("after_reads_v20", _append("after", "v_add_nc_u32_e32 v7, v20, v7")),
+    ("after_reads_v21", _append("after", "v_xor_b32_e32 v7, v21, v7")),
+    ("after_reads_scalar", _append("after", "v_add_nc_u32_e32 v7, s26, v7")),
+    ("after_readlane_v20", lambda p, r: p["after"].extend(
+        ["v_readlane_b32 s28, v20, 40", "v_add_nc_u32_e32 v7, s28, v7"])),
+    ("after_work", _append("after", "v_add_nc_u32_e32 v6, 1, v6")),
+    # work inside the region
+    ("work_more", _append("work", "v_xor_b32_e32 v7, v0, v7")),
+    ("work_restores", _append("work", "s_mov_b64 exec, s[10:11]")),
+]
+
+
+def vote_lines(rng, pixel=False):
+    """A mutated vote-with-prefix shape as a raw listing, and the names of the mutations applied."""
+    p, names = vote_base(), []
+    for _ in range(rng.randrange(1, 4)):
+        name, fn = rng.choice(VOTE_MUTATIONS)
+        fn(p, rng)
+        names.append(name)
+    run = list(p["prefix"]) + [p["narrow"]] + list(p["work"]) + ["s_mov_b64 exec, s[10:11]"]
+    hop = sum(_size(t) for t in run) // 4
+    epilogue = ["exp mrt0 v6, v7, v5, v5 done vm", "s_endpgm"] if pixel else \
+        ["exp pos0 v5, v5, v5, v5 done", "exp param0 v6, v7, v5, v5", "s_endpgm"]
+    body = ["s_mov_b64 s[10:11], exec"] + (list(PS_PIXEL) if pixel else []) + \
+        ["v_mov_b32_e32 v6, 0", "v_mov_b32_e32 v7, 0", "v_mov_b32_e32 v5, 0"] + \
+        p["head"] + [f"{p['vote']} {hop}"] + run + list(p["after"]) + epilogue
+    return names, [(text, _size(text)) for text in body]
+
+
 def one_program(mode, seed, index, depth):
     """(label, listing) of program `index` of a batch: deterministic in (mode, seed, index, depth)."""
     rng = random.Random(f"{mode}:{seed}:{index}")
     pixel = mode in PS_MODES
     if mode in ("kill", "ps_kill"):
         names, lines = kill_lines(rng, pixel)
+        return ",".join(names), lines
+    if mode in ("vote", "ps_vote"):
+        names, lines = vote_lines(rng, pixel)
         return ",".join(names), lines
     body = cf_diff.generate(rng, 64, max_depth=depth, budget=rng.randrange(3, 11))
     used = inject(rng, body, rng.randrange(1, 4)) if mode in ("idioms", "ps_idioms") else []
@@ -473,7 +569,7 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=1, help="batch seed; the batch is deterministic in it")
     p.add_argument("--depth", type=int, default=3, help="maximum control-flow nesting of a generated body")
     p.add_argument("--mode", choices=MODES + ("all",), default="all",
-                   help="flow/idioms/kill run a vertex frame, ps/ps_idioms/ps_kill a pixel one; idioms splices in the cross-lane fragments, kill mutates the pixel-kill shape")
+                   help="flow/idioms/kill/vote run a vertex frame, the ps_ ones a pixel frame; idioms splices in the cross-lane fragments, kill and vote mutate the pixel-kill and the vote-prefix shape")
     p.add_argument("--report", help="write the counts to this JSON file")
     p.add_argument("--verbose", action="store_true", help="print every program's tier")
     p.add_argument("--self-test", action="store_true", help="check the harness itself and exit")
