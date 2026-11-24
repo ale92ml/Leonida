@@ -179,3 +179,53 @@ def test_saveexec_variants_match(op_name, wave):
     body = [("saveexec", FEW_LANES, op_name, "s_cbranch_scc0", [("probe", 13), ("op", "v_add_nc_u32 v9, 1, v9")])]
     status, detail = cf_diff.run_case(f"ps_saveexec_{op_name}", body, wave, structured=True)
     assert status == "match", detail
+
+
+# s10 = 3 in the Emitter prologue, so `eq` holds for this pair and every other CCS condition is decided by it.
+SIF_SREG, SIF_K = 10, 3
+
+
+def sif_body(cc):
+    return [("sif", (cc, SIF_SREG, SIF_K), True, [("probe", 5)], None)]
+
+
+def sif_text(cc):
+    return "\n".join(text for text, _ in cf_diff.build(sif_body(cc), 32))
+
+
+def test_sif_emits_the_sopc_inequality_mnemonic():
+    """SOPC spells "not equal" `lg`: s_cmp_lg_i32/u32 are opcodes 0x1 and 0x7 and no SOPC opcode is named
+    s_cmp_ne_* (tools/rdna2_isa_tables.py SOPC), while VOPC has v_cmp_ne_u32. Emitting the VOPC spelling in an
+    `sif` made the translator refuse the program by mnemonic (rdna2spirv.SOPC_CMP32_OPS), so the fuzzer counted a
+    skip and compared nothing for that program."""
+    assert "s_cmp_lg_u32" in sif_text("ne")
+    assert "s_cmp_ne" not in sif_text("ne")
+    for cc in cf_diff.CCS:
+        emitted = [line for line in sif_text(cc).splitlines() if line.startswith("s_cmp_")]
+        assert len(emitted) == 1, (cc, emitted)
+        mnemonic, operands = emitted[0].split(None, 1)
+        assert mnemonic in rdna2spirv.SOPC_CMP32_OPS, (cc, mnemonic)
+        assert operands == f"s{SIF_SREG}, {SIF_K}", (cc, operands)
+
+
+@pytest.mark.parametrize("cc", cf_diff.CCS)
+@pytest.mark.parametrize("structured", (True, False), ids=("structured", "dispatch-loop"))
+def test_every_sif_condition_is_compared_not_skipped(cc, structured):
+    status, detail = cf_diff.run_case(f"ps_sif_{cc}", sif_body(cc), 32, structured)
+    assert status == "match", detail
+
+
+def test_the_sif_inequality_takes_the_other_side_than_equality():
+    """A mnemonic that merely translates is not enough: `lg` has to be the condition `ne` asked for. The probe
+    word records whether the body ran, so mapping `ne` onto a condition that holds for s10 == 3 is caught."""
+    def probe_word(cc):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, f"ps_sif_{cc}.s")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(cf_diff.listing_text(cf_diff.build(sif_body(cc), 32), f"ps_sif_{cc}"))
+            return cf_ref.run(path, wave=32)["exports"][0][3]
+
+    ran, skipped = probe_word("eq"), probe_word("ne")
+    assert ran == 1 * 33 + 5          # v11 starts at 1 and the probe takes it to 38
+    assert skipped == 1               # s10 == 3, so the `lg` body is branched over
+    assert ran != skipped
