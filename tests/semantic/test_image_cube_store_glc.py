@@ -12,14 +12,15 @@ These tests verify:
 """
 import os
 import re
-import shlex
 import shutil
 import struct
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import support
+import mc_command
 import rdna2spirv
 
 PS_EPILOGUE = ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"]
@@ -52,9 +53,19 @@ def vdata_reg(dmask, d16=False):
 def llvm_mc_cmd():
     env = os.environ.get("LLVM_MC")
     if env:
-        return shlex.split(env)
+        return mc_command.mc_command(env)
     exe = shutil.which("llvm-mc")
     return [exe] if exe else None
+
+
+class LlvmMcCommandTests(unittest.TestCase):
+    def test_explicit_path_with_spaces_is_one_argument(self):
+        with tempfile.TemporaryDirectory(prefix="llvm tools ") as directory:
+            exe = os.path.join(directory, "llvm-mc.exe")
+            with open(exe, "wb"):
+                pass
+            with mock.patch.dict(os.environ, LLVM_MC=exe):
+                self.assertEqual(llvm_mc_cmd(), [exe])
 
 
 def validate_spirv(spvasm):
