@@ -22,6 +22,7 @@ from test_wave64_halves import (  # noqa: E402
     out_param,
     ps,
     run_cut,
+    size,
     vs,
 )
 
@@ -32,6 +33,30 @@ SLOT = ["v_readfirstlane_b32 s7, v11", "v_add_nc_u32_e32 v13, s7, {rank}",
         "v_lshlrev_b32_e32 v13, 2, v13",
         "buffer_store_dword v0, v13, s[0:3], 0 offen offset:256"]
 ELECT_NARROWED = ["v_cmp_eq_u32_e32 vcc, 0, v10", "s_and_saveexec_b64 s[14:15], vcc"]
+
+# The region an EXEC vote lets a half skip: lanes 0-31 are the only active ones, so the wave votes yes while the
+# upper half, with no active lane, jumps straight to the join.
+EXEC_SKIP_HEAD = ["v_cmp_gt_u32_e32 vcc, 32, v0", "s_and_saveexec_b64 s[12:13], vcc"]
+# EXEC = f(S0, EXEC) of the saveexec forms, read with EXEC zero: these set every bit, from an S0 of all ones and
+# from an empty S0 respectively, so the lanes of the skipping half come back on in the wave.
+WIDEN_FROM_ONES = ("or", "xor", "andn2", "orn2")
+WIDEN_FROM_EMPTY = ("orn1", "nand", "nor", "xnor")
+
+
+def nested_if_else(then_body=("v_add_nc_u32_e32 v6, 7, v6",), else_body=("v_add_nc_u32_e32 v7, 3, v7",)):
+    """LLVM's SI_IF / SI_ELSE pair: every mask it works with it took from EXEC, so nesting it in a skipped region
+    keeps EXEC zero there, `s_or_saveexec_b64` included."""
+    then_body, else_body = list(then_body), list(else_body)
+    return ["v_cmp_gt_u32_e32 vcc, 8, v0", "s_and_saveexec_b64 s[16:17], vcc",
+            "s_xor_b64 s[16:17], exec, s[16:17]",
+            f"s_cbranch_execz {sum(size(t) for t in then_body) // 4}"] + then_body +         ["s_or_saveexec_b64 s[16:17], s[16:17]", "s_xor_b64 exec, exec, s[16:17]",
+         f"s_cbranch_execz {sum(size(t) for t in else_body) // 4}"] + else_body +         ["s_or_b64 exec, exec, s[16:17]"]
+
+
+def execz_skip(body):
+    """`body` behind an `s_cbranch_execz` that the upper half takes, then the join and the launch mask back."""
+    hop = sum(size(t) for t in body) // 4
+    return EXEC_SKIP_HEAD + [f"s_cbranch_execz {hop}"] + body +         ["s_or_b64 exec, exec, s[12:13]", "s_mov_b64 exec, s[10:11]"]
 
 
 class SoundnessRegressions(unittest.TestCase):
@@ -412,6 +437,68 @@ class SoundnessRegressions(unittest.TestCase):
             "v_readfirstlane_b32 s5, v5",
             "v_mov_b32_e32 v6, s5",
         ], "B", reasons=[], idioms=["readfirstlane-uniform"])
+
+    # -- EXEC writes in the region a wave-wide EXEC vote lets a half skip
+    def test_saveexec_that_sets_a_missing_exec_bit_is_tier_c(self):
+        """The vote is accepted because the half that jumps to the join misses only work its lanes are masked out
+        of. A saveexec whose ISA function gives a non-zero EXEC from a zero one puts those lanes back on, so the
+        wave runs the rest of the region for them and the half does not."""
+        for kind in WIDEN_FROM_ONES + WIDEN_FROM_EMPTY:
+            ones = kind in WIDEN_FROM_ONES
+            setup = ["s_mov_b64 s[14:15], -1"] if ones else ["v_cmp_gt_u32_e32 vcc, 8, v0"]
+            self.assert_tier_c_and_diverges(f"vs_execz_{kind}", execz_skip(setup + [
+                f"s_{kind}_saveexec_b64 s[16:17], {'s[14:15]' if ones else 'vcc'}",
+                "v_add_nc_u32_e32 v6, 7, v6",
+                "s_mov_b64 exec, s[16:17]",
+            ]), contains=["unsafe-execz-branch"])
+
+    def test_plain_exec_write_in_the_skipped_region_is_tier_c(self):
+        for name, write in (("mov", "s_mov_b64 exec, s[14:15]"),
+                            ("or", "s_or_b64 exec, exec, s[14:15]"),
+                            ("xor", "s_xor_b64 exec, exec, s[14:15]"),
+                            ("not", "s_not_b64 exec, s[18:19]")):
+            self.assert_tier_c_and_diverges(f"vs_execz_plain_{name}", execz_skip([
+                "s_mov_b64 s[14:15], -1", "s_mov_b64 s[18:19], exec", write,
+                "v_add_nc_u32_e32 v6, 7, v6", "s_mov_b64 exec, s[18:19]",
+            ]), contains=["unsafe-execz-branch"])
+
+    def test_exec_loop_whose_body_sets_a_missing_bit_is_tier_c(self):
+        """A half whose lanes have all left a loop closed by `s_cbranch_execnz` skips the iterations the wave
+        still runs, so the same rule holds for the loop exit the vote takes."""
+        # One trip for lanes 0-31 and two for lanes 32-63, so the wave keeps iterating after the lower half is
+        # done and the widening gives its lanes a second `v6 += 7` that two waves of 32 never run.
+        body = ["v_add_nc_u32_e32 v9, 1, v9", "s_mov_b64 s[14:15], -1",
+                "s_or_b64 exec, exec, s[14:15]", "v_add_nc_u32_e32 v6, 7, v6",
+                "v_cmp_lt_u32_e32 vcc, v9, v10", "s_and_b64 exec, exec, vcc"]
+        self.assert_tier_c_and_diverges("vs_execnz_loop_widens", [
+            "v_lshrrev_b32_e32 v10, 5, v0", "v_add_nc_u32_e32 v10, 1, v10", "v_mov_b32_e32 v9, 0",
+        ] + body + [f"s_cbranch_execnz {-(sum(size(t) for t in body) // 4) - 1}",
+                    "s_mov_b64 exec, s[10:11]"],
+            contains=["unsafe-execz-branch"])
+
+    def test_exec_skip_clean_controls(self):
+        """What the region may do: narrow EXEC, and widen it back out of a mask it took from the zero EXEC. The
+        last case is the point of the rule - `s_or_saveexec_b64` on a VCC the region wrote with no active lane
+        keeps EXEC zero, so the form of the instruction decides nothing on its own."""
+        for name, body in (
+                ("and_saveexec", ["v_cmp_gt_u32_e32 vcc, 8, v0", "s_and_saveexec_b64 s[16:17], vcc",
+                                  "v_add_nc_u32_e32 v6, 7, v6", "s_or_b64 exec, exec, s[16:17]"]),
+                ("andn1_saveexec", ["v_cmp_gt_u32_e32 vcc, 8, v0", "s_andn1_saveexec_b64 s[16:17], vcc",
+                                    "v_add_nc_u32_e32 v6, 7, v6", "s_mov_b64 exec, s[16:17]"]),
+                ("cmpx", ["s_mov_b64 s[18:19], exec", "v_cmpx_gt_u32_e32 8, v0",
+                          "v_add_nc_u32_e32 v6, 7, v6", "s_mov_b64 exec, s[18:19]"]),
+                ("and_exec", ["s_mov_b64 s[18:19], exec", "v_cmp_gt_u32_e32 vcc, 8, v0",
+                              "s_and_b64 exec, exec, vcc", "v_add_nc_u32_e32 v6, 7, v6",
+                              "s_mov_b64 exec, s[18:19]"]),
+                ("or_saveexec_of_an_empty_vcc", ["s_mov_b64 s[18:19], exec", "v_cmp_gt_u32_e32 vcc, 8, v0",
+                                                 "s_or_saveexec_b64 s[16:17], vcc",
+                                                 "v_add_nc_u32_e32 v6, 7, v6", "s_mov_b64 exec, s[18:19]"]),
+                ("nested_if_else", nested_if_else()),
+        ):
+            full = f"vs_execz_clean_{name}"
+            (tier, reasons, _), asm = meta_of(full, vs(execz_skip(body)))
+            self.assertEqual(tier, "A", f"{full}: got {tier}, reasons={reasons}")
+            self.assertEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)), full)
 
 
 if __name__ == "__main__":

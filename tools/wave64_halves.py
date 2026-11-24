@@ -99,6 +99,11 @@ MOVREL_OPS = (
 MASK_BITWISE = ("s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand_b", "s_nor_b", "s_xnor_b", "s_not_b",
                 "s_mov_b", "s_cselect_b", "s_wqm_b")
 DPP_BAD = ("row_bcast", "wave_")
+# EXEC = f(S0, EXEC) of the SAVEEXEC / WREXEC forms (RDNA2 ISA SOP1, the table in rdna2spirv Gen.EXEC_LOGIC), read
+# with a zero EXEC: "zero" is zero whatever S0 is (S0 & EXEC, ~S0 & EXEC), "s0" is zero when S0 is (S0 | EXEC,
+# S0 ^ EXEC, S0 & ~EXEC), and the rest complement a zero and set every bit (see Analysis.exec_kept_zero).
+SAVEEXEC_ZERO = {"s_and": "zero", "s_andn1": "zero", "s_or": "s0", "s_xor": "s0", "s_andn2": "s0",
+                 "s_orn1": None, "s_orn2": None, "s_nand": None, "s_nor": None, "s_xnor": None}
 UVOTE = ("uvote", None)  # tag of a lane mask that is all launch lanes or none in the wave and in each half (see vote)
 
 
@@ -1332,8 +1337,13 @@ class Analysis:
             # The side that runs when EXEC is zero is taken by a half with no active lane, not only by a wave with
             # none, and then runs its scalar work and effects while the other half does not. So it must be the join
             # (or only jumps to it). The exit of a loop closed by the vote is the join of every lane: allowed.
-            if run is None or skip is None or (self.reaches(run, n, -1) and not self.reaches(skip, n, -1)) \
-                    or self.reaches(run, self.past_jumps(skip), n):
+            # The other side is then run by the wave with that half's lanes off, which is only inert for them while
+            # EXEC stays zero there (exec_kept_zero).
+            if run is None or skip is None:
+                return
+            join = self.past_jumps(skip)
+            if ((self.reaches(run, n, -1) and not self.reaches(skip, n, -1)) or self.reaches(run, join, n)) \
+                    and self.exec_kept_zero(run, join):
                 return
             if ev is not None:
                 ev["viol"].append(("unsafe-execz-branch", ins.get("pc"), op))
@@ -1503,6 +1513,90 @@ class Analysis:
         elif dests and _mask64(dests[0]) and combine(op, srcs):
             new_sub.add(tuple(_regs(dests[0])))
         return inside, frozenset(new_sub)
+
+    def exec_kept_zero(self, run, join):
+        """Whether the code a wave-wide EXEC vote lets a half skip stays inert for that half's lanes.
+
+        The vote is accepted because a half with no active lane jumps to the join while the wave runs the region
+        with those lanes off, and lane-masked work writes nothing for them. That holds only as long as EXEC stays
+        zero in the region: `s_xnor_saveexec_b64`, `s_nor_saveexec_b64`, `s_or_b64 exec, exec, <an outer mask>`
+        and the other forms that set a bit EXEC does not have put those lanes back on, and the region's work then
+        reaches them in the wave and not in the half.
+
+        A must-dataflow from `run` to `join`, in the shape of `confined`: the 64-bit lane-mask registers that are
+        zero on the path that entered with EXEC = 0 (EXEC itself, and what the region computes from it - a `v_cmp`
+        destination included, since VOPC writes zero to the bits of inactive lanes). A write to EXEC keeps it zero
+        only when the ISA function gives zero from a zero EXEC and zero sources. Scalar values the region defines
+        are the `stale` check's business; a scalar store or `s_sendmsg` in the region is not modelled here.
+        """
+        if run == join:
+            return True                      # both sides go to the same place: the vote skips nothing
+        entry = {run: frozenset({("exec",)})}
+        work = [run]
+        while work:
+            b = work.pop()
+            zero = entry[b]
+            for ins in self.blocks[b]:
+                zero = self.zero_step(ins, zero)
+                if zero is None:
+                    return False
+            for s in self.succ[b]:
+                if s == join:
+                    continue
+                new = zero if s not in entry else (entry[s] & zero)
+                if s not in entry or new != entry[s]:
+                    entry[s] = new
+                    work.append(s)
+        return True
+
+    @staticmethod
+    def zero_step(ins, zero):
+        """`zero` after `ins`, or None when `ins` can give EXEC a bit it does not have (see exec_kept_zero)."""
+        op, a = base_op(ins["op"]), ins["args"]
+        dests, srcs, defs, _ = operands(ins)
+
+        def ok(x):
+            return _zero(x) or (bool(_regs(x)) and not _half(x) and tuple(_regs(x)) in zero)
+
+        def combine(o, xs):
+            if o in ("s_mov_b64", "s_wqm_b64") and len(xs) == 1:
+                return ok(xs[0])
+            if o == "s_and_b64" and len(xs) == 2:
+                return ok(xs[0]) or ok(xs[1])
+            if o == "s_andn2_b64" and len(xs) == 2:
+                return ok(xs[0])
+            if o == "s_andn1_b64" and len(xs) == 2:
+                return ok(xs[1])
+            if o in ("s_or_b64", "s_xor_b64", "s_cselect_b64") and len(xs) == 2:
+                return ok(xs[0]) and ok(xs[1])
+            return False
+
+        written = {r for x in dests for r in _regs(x)} | set(defs)
+        new = {k for k in zero if not set(k) & written}
+        if "exec" in written:
+            if op.startswith("v_cmpx"):
+                new.add(("exec",))                                  # EXEC &= the compare
+            elif any(op.startswith(p) for p in SAVEEXEC) and op.endswith("_b64") and len(a) == 2 \
+                    and not _half(a[0]) and not _half(a[1]):
+                need = SAVEEXEC_ZERO.get(op.split("_saveexec_")[0].split("_wrexec_")[0])
+                still_zero = need == "zero" or (need == "s0" and ok(a[1]))
+                if not still_zero:
+                    return None
+                new.add(("exec",))
+                if _mask64(a[0]):
+                    new.add(tuple(_regs(a[0])))   # saveexec: the old EXEC; wrexec: the new one, zero either way
+            elif dests and _regs(dests[0]) == ["exec"] and not _half(dests[0]) and combine(op, srcs):
+                new.add(("exec",))
+            else:
+                return None
+        elif "vcc" in defs and op.startswith("v_cmp") and not op.startswith("v_cmpx"):
+            new.add(("vcc",))                     # VOPC writes zero to the bits of the inactive lanes
+        elif dests and _mask64(dests[0]):
+            if op.startswith("v_cmp") and not op.startswith("v_cmpx"):
+                new.add(tuple(_regs(dests[0])))
+            elif combine(op, srcs):
+                new.add(tuple(_regs(dests[0])))
+        return frozenset(new)
 
     def past_jumps(self, blk):
         """`blk`, or where it leads when it holds nothing but jumps and waits (the layout of a vccnz skip)."""
