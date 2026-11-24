@@ -70,6 +70,16 @@ def test_generation_is_deterministic():
     assert cf_diff.program_for(5, 3, 32, 3) != cf_diff.program_for(5, 4, 32, 3)
 
 
+@pytest.mark.parametrize("wave", (32, 64))
+def test_not_equal_emits_distinct_scalar_and_vector_opcodes(wave):
+    body = [("sif", ("ne", 10, 4), True, [("probe", 1)], [("probe", 2)]),
+            ("if", ("ne", "u32", 4, 3), True, [("probe", 3)])]
+    opcodes = {text.split()[0] for text, _ in cf_diff.build(body, wave)}
+    assert {"s_cmp_lg_u32", "v_cmp_ne_u32_e32"} <= opcodes
+    status, detail = cf_diff.run_case("ps_not_equal", body, wave)
+    assert status == "match", detail
+
+
 def test_branch_offsets_land_on_their_labels():
     e = cf_diff.Emitter(32)
     e.program([("if", FEW_LANES, True, [("probe", 3)]), ("sloop", 2, [("probe", 4)])])
