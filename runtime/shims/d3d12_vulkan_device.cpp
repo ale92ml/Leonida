@@ -3104,8 +3104,6 @@ struct PipelineStream {
     D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
     D3D12_SHADER_BYTECODE ms{};
     D3D12_SHADER_BYTECODE as{};
-    bool has_cs = false;
-    bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
 };
 
 HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, PipelineStream& out) {
@@ -3162,26 +3160,19 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             std::memcpy(&value, base + payload, sizeof(T));
             at = round_up(payload + sizeof(T), sizeof(void*));
         };
-        const auto stage = [&](D3D12_SHADER_BYTECODE& code) {
-            take(code);
-            out.has_graphics_stage = true;
-        };
         switch (type) {
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
             take(g.pRootSignature);
             out.compute.pRootSignature = g.pRootSignature;
             break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: stage(g.VS); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: stage(g.PS); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: stage(g.DS); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: stage(g.HS); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: stage(g.GS); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: stage(out.as); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: stage(out.ms); break;
-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
-            take(out.compute.CS);
-            out.has_cs = true;
-            break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: take(g.VS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: take(g.PS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: take(g.DS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: take(g.HS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: take(g.GS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: take(out.as); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: take(out.ms); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS: take(out.compute.CS); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: take(g.StreamOutput); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: take(g.BlendState); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: take(g.SampleMask); break;
@@ -3283,9 +3274,11 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         }
         if (!ok) return E_INVALIDARG;
     }
-    if (out.has_cs && out.has_graphics_stage) return E_INVALIDARG;  // a compute stage with graphics stages
-    if (!out.has_cs && !out.has_graphics_stage) return E_INVALIDARG;
-    return S_OK;
+    // A fixed-layout stream may contain every shader subobject. Exactly one bytecode pointer selects the
+    // pipeline kind (VS, MS or CS); the other shader stages do not participate in this choice.
+    const unsigned selectors = (g.VS.pShaderBytecode != nullptr) + (out.ms.pShaderBytecode != nullptr) +
+                               (out.compute.CS.pShaderBytecode != nullptr);
+    return selectors == 1 ? S_OK : E_INVALIDARG;
 }
 
 class PipelineState final
@@ -6164,8 +6157,9 @@ public:
         if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return d3d12_trace::result(method, hr);
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
-        const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
-                                         : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as);
+        const HRESULT hr = stream.compute.CS.pShaderBytecode
+                               ? pipeline->create_compute(stream.compute)
+                               : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as);
         if (FAILED(hr)) {
             pipeline->Release();
             return d3d12_trace::result(method, hr);

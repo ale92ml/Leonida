@@ -4,7 +4,7 @@
 //     E_NOTIMPL; that part runs on every GPU. The rest needs the extension (exit 77 without it).
 //   - With it: MeshShaderTier 1; CreatePipelineState builds an MS + PS PSO and a VS + PS PSO from streams laid out as
 //     d3dx12.h lays them out (each subobject a type and its description, pointer-aligned); streams the PC runtime
-//     refuses (MS with VS, CS with PS, a subobject twice or in two versions, an unknown type, a truncated stream) are E_INVALIDARG, and
+//     refuses (MS with VS or CS, a subobject twice or in two versions, an unknown type, a truncated stream) are E_INVALIDARG, and
 //     state not built yet (an amplification shader, a depth-bounds test) is E_NOTIMPL.
 //   - Draws: DispatchMesh(2, 2, 1) with root constants (0, 0) and a red tint fills the top-left quadrant;
 //     DispatchMesh(1, 1, 2) moved by (1, -1) with a green tint fills the top half of the bottom-right one, so the
@@ -36,12 +36,6 @@ using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slot 9: ha
 
 namespace {
 
-// One pipeline state stream subobject as d3dx12.h declares it (CD3DX12_PIPELINE_STATE_STREAM_SUBOBJECT).
-template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename Inner>
-struct alignas(void*) Subobject {
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
-    Inner inner;
-};
 using RootSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*>;
 using VsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE>;
 using PsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE>;
@@ -204,11 +198,15 @@ int main() {
         Stream mesh_stream;
         mesh_stream.add(RootSubobject{.inner = root.p}).add(MsSubobject{.inner = ms}).add(PsSubobject{.inner = ps});
         mesh_stream.add(TargetsSubobject{.inner = one_target()});
-        EXPECT(SUCCEEDED(create(device.p, mesh_stream, mesh_pso)));
+        // Fixed-layout streams also contain subobjects for inactive shader stages.
+        Stream mesh_with_placeholders = mesh_stream;
+        mesh_with_placeholders.add(VsSubobject{}).add(CsSubobject{});
+        EXPECT(SUCCEEDED(create(device.p, mesh_with_placeholders, mesh_pso)));
         Stream vs_stream;
         vs_stream.add(RootSubobject{.inner = root.p}).add(VsSubobject{.inner = vs}).add(PsSubobject{.inner = ps});
         vs_stream.add(TopologySubobject{.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE});
         vs_stream.add(TargetsSubobject{.inner = one_target()});
+        vs_stream.add(CsSubobject{}).add(MsSubobject{});
         EXPECT(SUCCEEDED(create(device.p, vs_stream, vs_pso)));
 
         // Streams the PC runtime refuses.

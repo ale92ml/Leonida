@@ -61,6 +61,41 @@ HRESULT create_compute(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DES
     return dev->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso.p));
 }
 
+bool check_stream_stages(const char* device_name, ID3D12Device* device, ID3D12RootSignature* root,
+                         D3D12_SHADER_BYTECODE cs, D3D12_SHADER_BYTECODE vs, D3D12_SHADER_BYTECODE ps,
+                         unsigned& checked) {
+    Ref<ID3D12Device2> device2;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device2.p)))) return false;
+    struct {
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, D3D12_SHADER_BYTECODE> cs;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+    } stream{};
+    stream.root.inner = root;
+    const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), &stream};
+    const auto check = [&](const char* stages, HRESULT expected) {
+        Ref<ID3D12PipelineState> pso;
+        const HRESULT hr = device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pso.p));
+        if (hr == expected && (pso.p != nullptr) == SUCCEEDED(expected)) {
+            ++checked;
+            return true;
+        }
+        std::fprintf(stderr, "%s stream [%s]: got 0x%08lx, expected 0x%08lx\n", device_name, stages,
+                     static_cast<unsigned long>(hr), static_cast<unsigned long>(expected));
+        return false;
+    };
+    stream.cs.inner = cs;
+    if (!check("CS, empty VS and PS", S_OK)) return false;
+    stream.ps.inner = ps;
+    if (!check("CS and PS", S_OK)) return false;
+    stream.cs.inner = {};
+    if (!check("PS only", E_INVALIDARG)) return false;
+    stream.cs.inner = cs;
+    stream.vs.inner = vs;
+    return check("CS and VS", E_INVALIDARG);
+}
+
 }  // namespace
 
 int main() {
@@ -275,6 +310,12 @@ int main() {
         }
         return true;
     };
+
+    for (const auto& host : hosts) {
+        EXPECT(check_stream_stages(host->name.c_str(), host->device.p, host->root.p, host->cs, host->vs_fullscreen,
+                                   host->ps_unorm, host_compared));
+    }
+    EXPECT(check_stream_stages("Vulkan", layer_dev.p, layer_root.p, layer_cs, layer_vs_fs, layer_ps_unorm, checked));
 
     // 1. Baseline & null pInputElementDescs crash guards.
     EXPECT(check_gfx_parity("gfx: baseline", S_OK, false, false, [](auto&) {}));

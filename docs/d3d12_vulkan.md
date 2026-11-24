@@ -2087,8 +2087,11 @@ The trace will enumerate them.
     mask `0xFFFFFFFF`, one sample.
   - The stream becomes the same descriptions `CreateGraphicsPipelineState` and `CreateComputePipelineState` take, so
     a VS stream builds the same PSO as the classic call.
-  - `E_INVALIDARG`, as on the PC runtime: a type given twice, an unknown type, a truncated stream, MS with VS,
-    tessellation or GS, CS with a graphics stage, or no stage at all.
+  - Exactly one of VS, MS and CS must have a non-null bytecode pointer. A fixed-layout stream may include empty
+    subobjects for the other two. A compute stream ignores PS. The Windows PSO validation test compares these
+    compute cases with native D3D12, and the mesh test reads back pixels from both MS and VS streams.
+  - The parser rejects duplicate types, unknown types and truncated payloads with `E_INVALIDARG`. A mesh pipeline
+    also rejects tessellation and geometry shaders.
   - `E_NOTIMPL` with a log, for what is not built yet: an AS, a depth-bounds test, separate front and back stencil
     masks, view instancing.
   - `RASTERIZER1`/`2`'s float depth bias is truncated to the integer the PSO path takes, with a log.

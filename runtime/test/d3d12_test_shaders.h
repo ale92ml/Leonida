@@ -15,6 +15,13 @@
 
 namespace d3d12test {
 
+// One pointer-aligned pipeline stream subobject, as laid out by d3dx12.h.
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename Inner>
+struct alignas(void*) Subobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+    Inner inner;
+};
+
 inline void put32(std::vector<std::uint8_t>& out, std::uint32_t v) {
     for (int i = 0; i < 4; ++i) out.push_back(std::uint8_t(v >> (8 * i)));
 }
