@@ -500,6 +500,123 @@ class SoundnessRegressions(unittest.TestCase):
             self.assertEqual(tier, "A", f"{full}: got {tier}, reasons={reasons}")
             self.assertEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)), full)
 
+    # -- what may run on a vote's run side before it narrows EXEC into the voted mask
+    def vote_skip(self, name, prefix, narrow="s_and_b64 exec, exec, s[22:23]",
+                  work=("v_mul_u32_u24_e32 v6, 3, v0",), after=()):
+        """A vote on a mask holding lanes 0-31 only, so the upper half votes no and skips the run side while the
+        wave runs it with that half's lanes still on. `prefix` runs there before the narrowing."""
+        run = list(prefix) + [narrow] + list(work) + ["s_mov_b64 exec, s[10:11]"]
+        hop = sum(size(t) for t in run) // 4
+        body = ["v_cmp_gt_u32_e32 vcc, 32, v0", "s_and_b64 s[20:21], vcc, exec", f"s_cbranch_scc0 {hop}"] + \
+            run + list(after)
+        return meta_of(name, vs(body))
+
+    def test_mask_arithmetic_before_the_narrowing_stays_tier_a(self):
+        """The run side may compute the mask it narrows into: the prefix writes only scalars, so a half that
+        votes no and skips the whole side cannot tell it ran, and the mask is a copy or an intersection of the
+        voted one, so EXEC after the narrowing holds no lane outside it. Each case is also run as one 64-lane
+        wave against two of 32 to show the two agree - before this rule all seven were tier C
+        `unsafe-vote-branch`."""
+        for name, kwargs in (
+                ("copy", dict(prefix=["s_mov_b64 s[22:23], s[20:21]"])),
+                ("copy_and_launch", dict(prefix=["s_and_b64 s[22:23], s[20:21], s[10:11]"])),
+                ("andn2", dict(prefix=["s_andn2_b64 s[22:23], s[20:21], vcc"])),
+                # the SCC is a plain scalar compare: one read from the mask would be mask-compare / tainted-exec
+                ("cselect", dict(prefix=["s_mov_b32 s26, 1", "s_cmp_lg_u32 s26, 0",
+                                         "s_mov_b64 s[24:25], s[20:21]",
+                                         "s_cselect_b64 s[22:23], s[20:21], s[24:25]"])),
+                ("xor_of_two_inside", dict(prefix=["s_mov_b64 s[24:25], s[20:21]",
+                                                   "s_xor_b64 s[22:23], s[20:21], s[24:25]"])),
+                ("copy_twice", dict(prefix=["s_mov_b64 s[22:23], s[20:21]",
+                                            "s_and_b64 s[24:25], s[22:23], s[10:11]"],
+                                    narrow="s_and_b64 exec, exec, s[24:25]")),
+                ("scalar_alu", dict(prefix=["s_add_u32 s26, s26, 1", "s_bcnt1_i32_b64 s27, s[20:21]",
+                                            "s_mov_b64 s[22:23], s[20:21]"])),
+                ("saveexec", dict(prefix=["s_mov_b64 s[22:23], s[20:21]"],
+                                  narrow="s_and_saveexec_b64 s[30:31], s[22:23]",
+                                  work=("v_mul_u32_u24_e32 v6, 3, v0", "s_or_b64 exec, exec, s[30:31]"))),
+        ):
+            with self.subTest(case=name):
+                full = f"vs_vote_prefix_{name}"
+                (tier, reasons, _), asm = self.vote_skip(full, **kwargs)
+                self.assertEqual(tier, "A", f"{full}: got {tier}, reasons={reasons}")
+                self.assertEqual(reasons, [], full)
+                self.assertEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)), full)
+
+    def test_a_prefix_mask_that_can_widen_past_the_vote_is_tier_c(self):
+        """`s_wqm_b64` and a union hold lanes the voted mask does not, so the wave would run the body for lanes a
+        half that voted no never runs it for. (The pixel-kill rule does allow `s_wqm_b64` here, but it also
+        demands `confined` and an inert exit; a plain vote has neither.)"""
+        for name, prefix, diverges in (
+                ("wqm", ["s_wqm_b64 s[22:23], s[20:21]"], False),
+                ("union", ["s_or_b64 s[22:23], s[20:21], s[10:11]"], True),
+                ("complement", ["s_not_b64 s[22:23], s[20:21]"], True),
+                ("launch_wqm", ["s_wqm_b64 s[22:23], s[10:11]"], True),
+                ("other_mask", ["v_cmp_gt_u32_e32 vcc, 48, v0", "s_mov_b64 s[22:23], vcc"], True),
+                ("undefined", [], False),
+        ):
+            with self.subTest(case=name):
+                full = f"vs_vote_prefix_wide_{name}"
+                (tier, reasons, _), asm = self.vote_skip(full, prefix)
+                self.assertEqual(tier, "C", f"{full}: got {tier}, reasons={reasons}")
+                self.assertIn("unsafe-vote-branch", reasons, full)
+                if diverges:
+                    self.assertNotEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)),
+                                        f"{full}: expected the two cuts to diverge")
+
+    def test_an_observable_prefix_before_the_narrowing_is_tier_c(self):
+        """Anything a half that skips the run side could notice keeps the program tier C: a VGPR the wave writes
+        for that half's lanes, a store, an export, a write to the voted mask, half of a mask pair, M0 (a later
+        `movrel` reads it), and an EXEC write that widens."""
+        for name, prefix, diverges in (
+                ("vgpr", ["v_mov_b32_e32 v6, 5", "s_mov_b64 s[22:23], s[20:21]"], True),
+                ("vgpr_add", ["v_add_nc_u32_e32 v6, 9, v6", "s_mov_b64 s[22:23], s[20:21]"], True),
+                ("store", ["global_store_dword v0, v6, s[4:5]", "s_mov_b64 s[22:23], s[20:21]"], False),
+                ("export", ["exp param1 v6, v7, v5, v5", "s_mov_b64 s[22:23], s[20:21]"], False),
+                ("load", ["s_load_dword s26, s[4:5], 0x0", "s_mov_b64 s[22:23], s[20:21]"], False),
+                ("mask_rewritten", ["s_mov_b64 s[20:21], exec", "s_mov_b64 s[22:23], s[20:21]"], True),
+                ("mask_half", ["s_mov_b32 s22, s20", "s_mov_b32 s23, s21"], False),
+                ("m0", ["s_mov_b32 m0, 4", "s_mov_b64 s[22:23], s[20:21]"], False),
+                ("exec_widened", ["s_or_b64 exec, exec, s[10:11]", "s_mov_b64 s[22:23], s[20:21]"], False),
+        ):
+            with self.subTest(case=name):
+                full = f"vs_vote_prefix_bad_{name}"
+                (tier, reasons, _), asm = self.vote_skip(full, prefix)
+                self.assertEqual(tier, "C", f"{full}: got {tier}, reasons={reasons}")
+                if diverges:
+                    self.assertNotEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)),
+                                        f"{full}: expected the two cuts to diverge")
+
+    def test_a_scalar_from_the_prefix_read_after_the_join_is_stale(self):
+        """The prefix may write scalars because a read of one defined behind a vote is already tier C
+        `stale-scalar`: the half that skipped kept the old value. This is that check firing, and the two cuts do
+        diverge."""
+        full = "vs_vote_prefix_stale"
+        (tier, reasons, _), asm = self.vote_skip(
+            full, ["s_mov_b64 s[22:23], s[20:21]", "s_mov_b32 s26, 7"],
+            after=["v_add_nc_u32_e32 v7, s26, v7"])
+        self.assertEqual(tier, "C", f"{full}: got {tier}, reasons={reasons}")
+        self.assertIn("stale-scalar", reasons, full)
+        self.assertNotEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)), full)
+
+    def test_a_prefix_scalar_of_a_vote_inside_a_loop_is_stale(self):
+        """The same check with the vote in a loop, where a half can vote yes on one trip and no on the next, so
+        the wave adds to the scalar once more than the half does: the loop's back edge is the second reaching
+        definition the `stale` check needs, and it fires."""
+        run = ["s_mov_b64 s[22:23], s[20:21]", "s_add_u32 s26, s26, 5", "s_and_b64 exec, exec, s[22:23]",
+               "v_mul_u32_u24_e32 v6, 3, v0", "s_mov_b64 exec, s[10:11]"]
+        hop = sum(size(t) for t in run) // 4
+        body = ["s_mov_b32 s26, 0", "s_mov_b32 s27, 0",
+                "v_cmp_gt_u32_e32 vcc, 32, v0", "v_cmp_gt_u32_e32 vcc, 32, v0",
+                "s_and_b64 s[20:21], vcc, exec", f"s_cbranch_scc0 {hop}"] + run + \
+               ["s_add_u32 s27, s27, 1", "s_cmp_lt_u32 s27, 2", f"s_cbranch_scc1 {-(hop + 7)}",
+                "v_add_nc_u32_e32 v7, s26, v7"]
+        full = "vs_vote_prefix_loop_stale"
+        (tier, reasons, _), asm = meta_of(full, vs(body))
+        self.assertEqual(tier, "C", f"{full}: got {tier}, reasons={reasons}")
+        self.assertIn("stale-scalar", reasons, full)
+        self.assertNotEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)), full)
+
 
 if __name__ == "__main__":
     unittest.main()
