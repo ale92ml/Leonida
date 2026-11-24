@@ -89,6 +89,30 @@ def check_output(code, output):
     return problems
 
 
+def timeout_problem(output, seconds):
+    """What a run that outlived its timeout left behind: the guest still running, or gta6rt stuck after it.
+
+    `game exited with code N` is printed after the guest's entry point returns and before gta6rt's ExitProcess, so a
+    run that printed it and did not end hung on the way out (in DLL_PROCESS_DETACH; docs/testing.md, Known problems)
+    rather than in the guest's frame. Without the output, both looked like the same bare timeout.
+    """
+    lines = output.replace("\r\n", "\n").split("\n")
+    exited = [line for line in lines if re.fullmatch(r"game exited with code -?\d+", line)]
+    if exited:
+        return (f"gta6rt printed `{exited[-1]}` but did not end within {seconds:g} s: the process hung on its way out "
+                "(ExitProcess), after the guest had finished")
+    last = next((line for line in reversed(lines) if line.strip()), "")
+    return (f"gta6rt did not finish within {seconds:g} s, before `game exited with code`; "
+            f"its last line was: {last or '(no output)'}")
+
+
+def as_text(value):
+    """TimeoutExpired's output: text on Windows (read again after the kill), bytes or None elsewhere."""
+    if value is None:
+        return ""
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+
+
 # Left set in a game's environment, these would put every D3D12 queue of the game on one VkQueue.
 QUEUE_TEST_SETTINGS = {"LEONIDA_VK_MAX_QUEUES_PER_FAMILY": "1", "LEONIDA_VK_GRAPHICS_FAMILY_ONLY": "1"}
 
@@ -115,8 +139,11 @@ def main():
                         help="also set the queue test settings (docs/testing.md), which the game's device must ignore")
     parser.add_argument("--runner", action="append", default=[],
                         help="run Windows executables through this command (repeat for its arguments), e.g. wine")
+    parser.add_argument("--timeout", type=float,
+                        help="seconds the probe and the run may take (default 90, or 180 with --runner)")
     options = parser.parse_args()
-    timeout = 180 if options.runner else 90  # a first start of Wine in a fresh prefix can take tens of seconds
+    # A first start of Wine in a fresh prefix can take tens of seconds.
+    timeout = options.timeout if options.timeout else 180 if options.runner else 90
 
     if options.probe:
         probe = subprocess.run([*options.runner, options.probe], capture_output=True, timeout=timeout)
@@ -127,9 +154,16 @@ def main():
     environment = dict(os.environ, LEONIDA_D3D12="vulkan")
     if options.queue_test_settings:
         environment.update(QUEUE_TEST_SETTINGS)
-    run = subprocess.run([*options.runner, options.loader, "--run", os.path.basename(options.guest), "--trace-d3d12"],
-                         cwd=os.path.dirname(os.path.abspath(options.guest)), env=environment, capture_output=True,
-                         text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    try:
+        run = subprocess.run([*options.runner, options.loader, "--run", os.path.basename(options.guest),
+                              "--trace-d3d12"], cwd=os.path.dirname(os.path.abspath(options.guest)), env=environment,
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        # run() has killed the process; what it printed until then tells where it stopped.
+        output = as_text(error.stdout) + as_text(error.stderr)
+        print(output)
+        print(f"FAIL: {timeout_problem(output, timeout)}")
+        return 1
     output = run.stdout + run.stderr
     problems = check_output(run.returncode, output)
     if options.queue_test_settings:
