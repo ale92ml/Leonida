@@ -49,7 +49,6 @@ on:
       - "tools/vk_subgroup_info.py"
       - "tools/wave64_emulate_opt.py"
       - "tools/wave64_halves.py"
-      - "tools/wave64_halves_diff.py"
       - "tools/xdxr_bvh.py"
   pull_request:
     paths:
@@ -89,7 +88,6 @@ on:
       - "tools/vk_subgroup_info.py"
       - "tools/wave64_emulate_opt.py"
       - "tools/wave64_halves.py"
-      - "tools/wave64_halves_diff.py"
       - "tools/xdxr_bvh.py"
   workflow_dispatch:
 
