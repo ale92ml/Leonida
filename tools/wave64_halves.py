@@ -200,6 +200,24 @@ def _mask64(a):
 
 ZERO_SCC = ("s_and_b64", "s_andn2_b64", "s_or_b64", "s_orn2_b64", "s_xor_b64", "s_nand_b64", "s_nor_b64",
             "s_xnor_b64", "s_not_b64", "s_wqm_b64")      # SCC = (64-bit result != 0)
+# Scalar ALU a half that votes no cannot notice, so it may run before a vote's EXEC narrowing (Analysis.narrows):
+# it reads lanes but writes only scalars, touches no memory and sends no message. `narrows` still rejects a write
+# to EXEC, M0, a VGPR or the voted mask, and the SAVEEXEC / WREXEC forms, which all start with one of these.
+VOTE_PREFIX_OPS = ("s_mov_b", "s_cmov_b", "s_cselect_b", "s_not_b", "s_and_b", "s_or_b", "s_xor_b", "s_andn1_b",
+                   "s_andn2_b", "s_orn1_b", "s_orn2_b", "s_nand_b", "s_nor_b", "s_xnor_b", "s_wqm_b", "s_quadmask_b",
+                   "s_brev_b", "s_bcnt0_i32", "s_bcnt1_i32", "s_ff0_i32", "s_ff1_i32", "s_flbit_i32", "s_bitset0_b",
+                   "s_bitset1_b", "s_bfm_b", "s_bfe_", "s_abs_i32", "s_absdiff_i32", "s_sext_i32", "s_add_", "s_sub_",
+                   "s_addc_u32", "s_subb_u32", "s_min_", "s_max_", "s_mul_", "s_addk_i32", "s_mulk_i32", "s_movk_i32",
+                   "s_cmp", "s_bitcmp", "s_lshl", "s_lshr", "s_ashr", "s_pack_", "s_bitreplicate_b64")
+
+
+def _mask_touched(key, written):
+    """Whether `written` holds any register of the 64-bit mask whose first register is `key`."""
+    if key == "vcc":
+        return bool({"vcc", "vcc_lo", "vcc_hi"} & {r for r in written if not isinstance(r, tuple)})
+    if isinstance(key, tuple) and len(key) == 2:
+        return key in written or (key[0], key[1] + 1) in written
+    return key in written
 # Before the run side narrows EXEC: mask arithmetic, and the SAVEEXEC/WREXEC forms whose new EXEC is S0 & EXEC or
 # S0 & ~EXEC (a narrowing into S0; confine_step decides whether S0 is inside, and what the destination holds).
 OFF_OK = ("s_nop", "s_waitcnt", "s_mov_b64", "s_wqm_b64", "s_and_b64", "s_and_saveexec_b64", "s_and_wrexec_b64",
@@ -1621,19 +1639,70 @@ class Analysis:
         return False
 
     def narrows(self, blk, reg):
+        """Whether the run side of a vote on mask `reg` starts by narrowing EXEC into that mask.
+
+        A half that votes no skips the run side while the wave runs it with that half's lanes still on, so the
+        code before the narrowing has to be something that half cannot notice. A scalar ALU instruction is: it
+        writes no lane's register and no memory, and the `stale` check already makes a later read of a scalar
+        defined behind a vote tier C `stale-scalar` (`stale_uses` marks a use whose reaching definitions include
+        one in a block control dependent on a voting block, and the vote block is in `self.voted` before this
+        runs). So a prefix of `VOTE_PREFIX_OPS` is allowed while it writes no VGPR, no EXEC, no M0 and not the
+        voted mask itself. Anything else - a VALU write, a load, a store, an export, `s_sendmsg`, a branch - ends
+        the search: `tools/wave64_halves_diff.py` measured that a VGPR write before the narrowing is the common
+        case in generated code, and proving one inert needs liveness this does not have.
+
+        The mask the narrowing uses must be `reg` or a copy or intersection of it, tracked in `sub` as
+        `confine_step` tracks its own: a mask that can hold a lane outside `reg` (`s_wqm_b64`, a union with
+        another mask) would have the wave run the body for lanes that a half voting no never runs it for. That is
+        why the pixel-kill rule, which does allow `s_wqm_b64` here, also demands `confined` and an inert exit.
+        """
+        sub = {reg}
         for ins in self.blocks[blk]:
             op = base_op(ins["op"])
             if op in ("s_waitcnt", "s_nop"):
                 continue
             a = ins["args"]
             if op.startswith(("s_and_saveexec_b64", "s_and_wrexec_b64")) and len(a) == 2:
-                return (_regs(a[1]) or [None])[0] == reg
+                return (_regs(a[1]) or [None])[0] in sub and not _half(a[1])
             if op in ("s_and_b64",) and len(a) == 3 and _regs(a[0]) == ["exec"]:
-                return reg in [(_regs(x) or [None])[0] for x in a[1:] if _regs(x) != ["exec"]]
+                return any((_regs(x) or [None])[0] in sub and not _half(x)
+                           for x in a[1:] if _regs(x) != ["exec"])
             if op == "s_mov_b64" and len(a) == 2 and _regs(a[0]) == ["exec"]:
-                return (_regs(a[1]) or [None])[0] == reg
-            return False
+                return (_regs(a[1]) or [None])[0] in sub and not _half(a[1])
+            sub = self.vote_prefix(ins, op, a, sub)
+            if sub is None:
+                return False
         return False
+
+    @staticmethod
+    def vote_prefix(ins, op, a, sub):
+        """`sub` after an instruction that runs before a vote's EXEC narrowing, or None when it may not run there
+        at all (see `narrows`). `sub` holds the first register of every 64-bit mask provably a subset of the voted
+        mask; a write to a mask that is not provably one takes it out again."""
+        if not op.startswith(VOTE_PREFIX_OPS) or "saveexec" in op or "wrexec" in op:
+            return None
+        dests, srcs, defs, _ = operands(ins)
+        written = {r for x in dests for r in _regs(x)} | set(defs)
+        if any(r == "exec" or r == "m0" or (isinstance(r, tuple) and r[0] in ("v", "m0")) for r in written):
+            return None
+        if any(isinstance(d, dict) and d.get("k") in ("vgpr",) for d in dests):
+            return None
+        new = {k for k in sub if not _mask_touched(k, written)}
+        if dests and _mask64(dests[0]) and not _half(dests[0]):
+            def ok(x):
+                return (_regs(x) or [None])[0] in new and not _half(x)
+            keep = False
+            if op in ("s_mov_b64",) and len(srcs) == 1:
+                keep = ok(srcs[0])
+            elif op == "s_and_b64" and len(srcs) == 2:
+                keep = ok(srcs[0]) or ok(srcs[1])
+            elif op == "s_andn2_b64" and len(srcs) == 2:
+                keep = ok(srcs[0])
+            elif op in ("s_or_b64", "s_xor_b64", "s_cselect_b64") and len(srcs) == 2:
+                keep = ok(srcs[0]) and ok(srcs[1])
+            if keep:
+                new.add(_regs(dests[0])[0])
+        return frozenset(new)
 
     # ---- fixpoint ----
     def run(self, stale):
