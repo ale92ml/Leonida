@@ -200,6 +200,32 @@ def _mask64(a):
 
 ZERO_SCC = ("s_and_b64", "s_andn2_b64", "s_or_b64", "s_orn2_b64", "s_xor_b64", "s_nand_b64", "s_nor_b64",
             "s_xnor_b64", "s_not_b64", "s_wqm_b64")      # SCC = (64-bit result != 0)
+# Scalar ALU a half that votes no cannot notice, so it may run before a vote's EXEC narrowing (Analysis.narrows):
+# it reads lanes but writes only scalars, touches no memory and sends no message. `narrows` still rejects a write
+# to EXEC, M0, a VGPR or the voted mask, and the SAVEEXEC / WREXEC forms, which all start with one of these.
+VOTE_PREFIX_OPS = ("s_mov_b", "s_cmov_b", "s_cselect_b", "s_not_b", "s_and_b", "s_or_b", "s_xor_b", "s_andn1_b",
+                   "s_andn2_b", "s_orn1_b", "s_orn2_b", "s_nand_b", "s_nor_b", "s_xnor_b", "s_wqm_b", "s_quadmask_b",
+                   "s_brev_b", "s_bcnt0_i32", "s_bcnt1_i32", "s_ff0_i32", "s_ff1_i32", "s_flbit_i32", "s_bitset0_b",
+                   "s_bitset1_b", "s_bfm_b", "s_bfe_", "s_abs_i32", "s_absdiff_i32", "s_sext_i32", "s_add_", "s_sub_",
+                   "s_addc_u32", "s_subb_u32", "s_min_", "s_max_", "s_mul_", "s_addk_i32", "s_mulk_i32", "s_movk_i32",
+                   "s_cmp", "s_bitcmp", "s_lshl", "s_lshr", "s_ashr", "s_pack_", "s_bitreplicate_b64")
+# Instructions that can read a VGPR of a lane that is not active: v_readlane / v_writelane address a lane by
+# number and ignore EXEC, and the permutes fetch another lane's register. A value only the wave wrote into a
+# half's lanes is observable through one of these even while those lanes are masked off, so a VGPR any of them
+# touches is never dead in the sense Analysis.dead_vgpr_write needs. DPP (quad_perm, row_*, wave_*) is the same
+# and is found from the modifiers; v_movrel* picks its register from M0, so nothing about it is static.
+CROSS_LANE = ("v_readlane_b32", "v_readfirstlane_b32", "v_writelane_b32", "ds_bpermute", "ds_permute",
+              "ds_swizzle", "v_permlane16", "v_permlanex16")
+DPP_MODS = ("quad_perm", "row_", "wave_", "dpp")
+
+
+def _mask_touched(key, written):
+    """Whether `written` holds any register of the 64-bit mask whose first register is `key`."""
+    if key == "vcc":
+        return bool({"vcc", "vcc_lo", "vcc_hi"} & {r for r in written if not isinstance(r, tuple)})
+    if isinstance(key, tuple) and len(key) == 2:
+        return key in written or (key[0], key[1] + 1) in written
+    return key in written
 # Before the run side narrows EXEC: mask arithmetic, and the SAVEEXEC/WREXEC forms whose new EXEC is S0 & EXEC or
 # S0 & ~EXEC (a narrowing into S0; confine_step decides whether S0 is inside, and what the destination holds).
 OFF_OK = ("s_nop", "s_waitcnt", "s_mov_b64", "s_wqm_b64", "s_and_b64", "s_and_saveexec_b64", "s_and_wrexec_b64",
@@ -276,6 +302,65 @@ class Analysis:
         self.voted = {}                              # block -> mask register key the terminating branch votes on
         self.branch_class = {}
         self.pure_spill_vgprs = self._find_pure_spill_vgprs()
+        self.cross_lane_vgprs = self._find_cross_lane_vgprs()
+        self._live_in = None
+
+    def _find_cross_lane_vgprs(self):
+        """VGPR numbers some instruction can read for a lane that is not active (see CROSS_LANE). A v_movrel*
+        chooses its register from M0, so every VGPR from the lowest one it names upwards counts."""
+        out, movrel_min = set(), None
+        for blk in self.blocks:
+            for ins in blk:
+                op, a = base_op(ins["op"]), ins["args"]
+                if op in MOVREL_OPS:
+                    for x in a:
+                        if x.get("k") == "vgpr":
+                            movrel_min = x["r"] if movrel_min is None else min(movrel_min, x["r"])
+                    continue
+                if op.startswith(CROSS_LANE) or op == "v_swap_b32" \
+                        or any(m.startswith(DPP_MODS) for m in (ins.get("mods") or [])):
+                    for x in a:
+                        out |= {r[1] for r in _regs(x) if isinstance(r, tuple) and r[0] == "v"}
+        if movrel_min is not None:
+            out |= set(range(movrel_min, 256))
+        return frozenset(out)
+
+    def vgpr_live_in(self):
+        """VGPR numbers live on entry to each block: read on some path out of it before being written again.
+        A backward fixpoint, `live_in = gen | (live_out - kill)`, where a partial write (`partial_write`) or a
+        read-modify-write destination reads as well as writes and so kills nothing."""
+        if self._live_in is not None:
+            return self._live_in
+        gen, kill = [], []
+        for blk in self.blocks:
+            g, k = set(), set()
+            for ins in reversed(blk):
+                op = base_op(ins["op"])
+                dests, srcs, _, _ = operands(ins)
+                written, read = set(), set()
+                for x in dests:
+                    regs = {r[1] for r in _regs(x) if isinstance(r, tuple) and r[0] == "v"}
+                    if partial_write(ins, op) or op in RMW_DEST or op == "v_swap_b32":
+                        read |= regs
+                    else:
+                        written |= regs
+                for x in srcs:
+                    read |= {r[1] for r in _regs(x) if isinstance(r, tuple) and r[0] == "v"}
+                g = (g - written) | read
+                k |= written
+            gen.append(frozenset(g))
+            kill.append(frozenset(k))
+        live = [frozenset()] * self.n
+        changed = True
+        while changed:
+            changed = False
+            for b in range(self.n - 1, -1, -1):
+                out = frozenset().union(*[live[s] for s in self.succ[b]]) if self.succ[b] else frozenset()
+                new = gen[b] | (out - kill[b])
+                if new != live[b]:
+                    live[b], changed = new, True
+        self._live_in = live
+        return live
 
     def _find_pure_spill_vgprs(self):
         """VGPRs used ONLY as constant-lane scalar spill storage (v_writelane_b32 / v_readlane_b32 with immediate
@@ -1350,8 +1435,9 @@ class Analysis:
             return
         # On hardware nobody runs the other side when some lane votes yes; a half whose lanes all vote no does. So
         # that side must be no code of its own: the join, which the run side reaches again.
-        ok = run is not None and self.narrows(run, reg) and skip is not None \
-            and self.reaches(run, self.past_jumps(skip), n)
+        join = self.past_jumps(skip) if skip is not None else None
+        ok = run is not None and skip is not None and self.narrows(run, reg, join) \
+            and self.reaches(run, join, n)
         # The early exit of a pixel kill: the side a half takes when its mask is empty only empties EXEC (from that
         # mask or 0), may export with that EXEC and ends, so it writes nothing; the run side narrows EXEC into the
         # mask's whole quads and never widens it again, so in the wave the lanes of that half stay off to the end.
@@ -1620,20 +1706,125 @@ class Analysis:
             work.extend(self.succ[b])
         return False
 
-    def narrows(self, blk, reg):
-        for ins in self.blocks[blk]:
+    def narrows(self, blk, reg, join=None):
+        """Whether the run side of a vote on mask `reg` starts by narrowing EXEC into that mask.
+
+        A half that votes no skips the run side while the wave runs it with that half's lanes still on, so the
+        code before the narrowing has to be something that half cannot notice. A scalar ALU instruction is: it
+        writes no lane's register and no memory, and the `stale` check already makes a later read of a scalar
+        defined behind a vote tier C `stale-scalar` (`stale_uses` marks a use whose reaching definitions include
+        one in a block control dependent on a voting block, and the vote block is in `self.voted` before this
+        runs). So a prefix of `VOTE_PREFIX_OPS` is allowed while it writes no VGPR, no EXEC, no M0 and not the
+        voted mask itself.
+
+        Per-lane arithmetic is allowed too, but only into VGPRs nobody reads again: the wave writes them for the
+        lanes of a half that votes no and the half does not, so the value has to die at `join`, the block the two
+        runs meet in (`dead_vgpr_write`, over `vgpr_live_in`). Anything else - a load, a store, an export,
+        `s_sendmsg`, a branch, a lane the instruction picks itself - ends the search.
+
+        The mask the narrowing uses must be `reg` or a copy or intersection of it, tracked in `sub` as
+        `confine_step` tracks its own: a mask that can hold a lane outside `reg` (`s_wqm_b64`, a union with
+        another mask) would have the wave run the body for lanes that a half voting no never runs it for. That is
+        why the pixel-kill rule, which does allow `s_wqm_b64` here, also demands `confined` and an inert exit.
+        """
+        sub = {reg}
+        for i, ins in enumerate(self.blocks[blk]):
             op = base_op(ins["op"])
             if op in ("s_waitcnt", "s_nop"):
                 continue
             a = ins["args"]
+            narrowed = None
             if op.startswith(("s_and_saveexec_b64", "s_and_wrexec_b64")) and len(a) == 2:
-                return (_regs(a[1]) or [None])[0] == reg
-            if op in ("s_and_b64",) and len(a) == 3 and _regs(a[0]) == ["exec"]:
-                return reg in [(_regs(x) or [None])[0] for x in a[1:] if _regs(x) != ["exec"]]
-            if op == "s_mov_b64" and len(a) == 2 and _regs(a[0]) == ["exec"]:
-                return (_regs(a[1]) or [None])[0] == reg
-            return False
+                narrowed = (_regs(a[1]) or [None])[0] in sub and not _half(a[1])
+            elif op in ("s_and_b64",) and len(a) == 3 and _regs(a[0]) == ["exec"]:
+                narrowed = any((_regs(x) or [None])[0] in sub and not _half(x)
+                               for x in a[1:] if _regs(x) != ["exec"])
+            elif op == "s_mov_b64" and len(a) == 2 and _regs(a[0]) == ["exec"]:
+                narrowed = (_regs(a[1]) or [None])[0] in sub and not _half(a[1])
+            if narrowed is not None:
+                return narrowed and self.exec_stays_inside(blk, i + 1, join)
+            sub = self.vote_prefix(ins, op, a, sub, join)
+            if sub is None:
+                return False
         return False
+
+    def exec_stays_inside(self, blk, start, join):
+        """Whether the region between a vote's EXEC narrowing and `join` can do nothing for the lanes of a half
+        that votes no: on every path from instruction `start` of block `blk`, loops included, EXEC either stays
+        inside the mask it was narrowed into, or only `OFF_OK` runs (mask arithmetic, a narrowing, nothing
+        observable) and branches. Restoring EXEC at the end of the region is the usual LLVM shape and is fine,
+        because at the join both runs have those lanes on again; what is not fine is per-lane work, a store or an
+        export after the widening, which the wave runs for lanes the half never ran it for.
+
+        The must-dataflow is `confined`'s, seeded just after the narrowing with EXEC inside and no register known
+        to be a subset, so an `s_or_b64 exec, exec, <saved before the narrowing>` reads as a widening. `confined`
+        itself never stops, because the pixel-kill rule needs those lanes off to the end of the program; here the
+        walk stops at `join`."""
+        entry = {blk: (True, frozenset())}
+        work = [(blk, start)]
+        while work:
+            b, at = work.pop()
+            inside, sub = entry[b]
+            for ins in self.blocks[b][at:]:
+                op = base_op(ins["op"])
+                if not inside and op not in OFF_OK and op not in BRANCHES:
+                    return False
+                inside, sub = self.confine_step(ins, inside, sub)
+            for s in self.succ[b]:
+                if s == join:
+                    continue
+                new = (inside, sub) if s not in entry else (entry[s][0] and inside, entry[s][1] & sub)
+                if new != entry.get(s):
+                    entry[s] = new
+                    work.append((s, 0))
+        return True
+
+    def dead_vgpr_write(self, ins, op, vgprs, join):
+        """Whether per-lane arithmetic may run before a vote's EXEC narrowing. The wave runs it with the lanes of
+        a half that votes no still on, and that half, which skips the whole side, does not, so the value must be
+        one nobody reads afterwards: every destination dead on entry to `join`, where the two runs meet again,
+        and out of reach of a cross-lane read, which would see it even while those lanes are masked off. The
+        instruction itself has to be plain arithmetic - not a load, not an export, not EXEC, and not one that
+        addresses a lane or a register of its own choosing."""
+        if join is None or not op.startswith("v_") or op.startswith(LOADS) or op.startswith(CROSS_LANE) \
+                or op.startswith("v_cmpx") or op in MOVREL_OPS or op == "v_swap_b32":
+            return False
+        if any(m.startswith(DPP_MODS) for m in (ins.get("mods") or [])):
+            return False
+        return not (vgprs & self.vgpr_live_in()[join]) and not (vgprs & self.cross_lane_vgprs)
+
+    def vote_prefix(self, ins, op, a, sub, join=None):
+        """`sub` after an instruction that runs before a vote's EXEC narrowing, or None when it may not run there
+        at all (see `narrows`). `sub` holds the first register of every 64-bit mask provably a subset of the voted
+        mask; a write to a mask that is not provably one takes it out again."""
+        dests, srcs, defs, _ = operands(ins)
+        written = {r for x in dests for r in _regs(x)} | set(defs)
+        if any(r == "exec" or r == "m0" or (isinstance(r, tuple) and r[0] == "m0") for r in written):
+            return None
+        vgprs = {r[1] for r in written if isinstance(r, tuple) and r[0] == "v"}
+        if vgprs:
+            if not self.dead_vgpr_write(ins, op, vgprs, join):
+                return None
+            # A VALU instruction writes no 64-bit mask, so `sub` only loses what its carry-out touches.
+            return frozenset({k for k in sub if not _mask_touched(k, written)})
+        if not op.startswith(VOTE_PREFIX_OPS) or "saveexec" in op or "wrexec" in op:
+            return None
+        new = {k for k in sub if not _mask_touched(k, written)}
+        if dests and _mask64(dests[0]) and not _half(dests[0]):
+            def ok(x):
+                return (_regs(x) or [None])[0] in new and not _half(x)
+            keep = False
+            if op in ("s_mov_b64",) and len(srcs) == 1:
+                keep = ok(srcs[0])
+            elif op == "s_and_b64" and len(srcs) == 2:
+                keep = ok(srcs[0]) or ok(srcs[1])
+            elif op == "s_andn2_b64" and len(srcs) == 2:
+                keep = ok(srcs[0])
+            elif op in ("s_or_b64", "s_xor_b64", "s_cselect_b64") and len(srcs) == 2:
+                keep = ok(srcs[0]) and ok(srcs[1])
+            if keep:
+                new.add(_regs(dests[0])[0])
+        return frozenset(new)
 
     # ---- fixpoint ----
     def run(self, stale):
