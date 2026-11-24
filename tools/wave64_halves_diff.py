@@ -204,7 +204,15 @@ def kill_base(pixel=False):
 
 
 def _set(key, index, text):
-    return lambda p, r: p[key].__setitem__(index, text)
+    """Replace element `index` of a part, or append when an earlier mutation of the same program shortened it:
+    `derive_none` empties the prefix, and a `derive_*` mutation drawn after it still means "put this instruction
+    in the prefix". Without the fallback the pair raises IndexError and takes the whole batch with it."""
+    def fn(p, r):
+        if index < len(p[key]):
+            p[key][index] = text
+        else:
+            p[key].append(text)
+    return fn
 
 
 def _put(key, text):
@@ -475,8 +483,14 @@ def one_program(mode, seed, index, depth):
 
 
 def check(mode, seed, index, depth):
-    """One program's verdict: a dict with its tier, reasons and whether the two cuts agree."""
-    label, lines = one_program(mode, seed, index, depth)
+    """One program's verdict: a dict with its tier, reasons and whether the two cuts agree, or a `harness` entry
+    when the generator itself failed - a bug in this file, not a finding about the analysis, and one that must not
+    take the rest of the batch with it."""
+    try:
+        label, lines = one_program(mode, seed, index, depth)
+    except Exception as e:                                  # noqa: BLE001 - reported, not swallowed
+        name = f"{'ps' if mode in PS_MODES else 'vs'}_w64d_{mode}_{seed}_{index:05d}"
+        return {"name": name, "label": "", "harness": f"{type(e).__name__}: {e}"}
     pixel = mode in PS_MODES
     cut = run_cut_ps if pixel else run_cut
     name = f"{'ps' if pixel else 'vs'}_w64d_{mode}_{seed}_{index:05d}"
@@ -523,8 +537,11 @@ def run_batch(mode, seed, programs, depth, verbose=False):
 def summarise(results):
     """Counts: tiers, how many tier A/B diverged (each a soundness bug), how many tier C agreed, and the skips."""
     out = {"programs": len(results), "tiers": {}, "unsound": 0, "compared": 0,
-           "tier_c_agree": 0, "tier_c_diverge": 0, "skips": {}, "reasons": {}}
+           "tier_c_agree": 0, "tier_c_diverge": 0, "skips": {}, "reasons": {}, "harness": {}}
     for r in results:
+        if "harness" in r:
+            out["harness"][r["harness"]] = out["harness"].get(r["harness"], 0) + 1
+            continue
         if "skip" in r and "tier" not in r:
             out["skips"][r["skip"]] = out["skips"].get(r["skip"], 0) + 1
             continue
@@ -594,7 +611,9 @@ def main(argv=None):
             print(f"    {n:6}  {reason}")
         for skip, n in sorted(counts["skips"].items(), key=lambda kv: -kv[1])[:5]:
             print(f"    skip {n:5}  {skip[:100]}")
-        if counts["unsound"]:
+        for bad, n in sorted(counts["harness"].items(), key=lambda kv: -kv[1])[:5]:
+            print(f"    HARNESS ERROR {n:5}  {bad[:100]}", file=sys.stderr)
+        if counts["unsound"] or counts["harness"]:
             status = 1
     if a.report:
         with open(a.report, "w", encoding="utf-8", newline="\n") as f:
