@@ -6565,15 +6565,19 @@ int main() {
                 Ref<ID3D12Device4> device4;
                 Ref<ID3D12Device10> device10;
                 Ref<ID3D12Resource> one, two;
-                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
-                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
+                // These are PC creation methods. Slot 78 on the Xbox proxy is SetFrameIntervalX.
+                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device4.p))));
+                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device10.p))));
                 EXPECT(SUCCEEDED(device4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                                   nullptr, IID_PPV_ARGS(&one.p))));
                 EXPECT(SUCCEEDED(device10->CreateReservedResource2(&tiled_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
                                                                    nullptr, 0, nullptr, IID_PPV_ARGS(&two.p))));
-                UINT tiles = 0;
-                device->GetResourceTiling(two.p, &tiles, nullptr, nullptr, nullptr, 0, nullptr);
-                EXPECT(tiles == 1);  // 8x8 RGBA8: one packed tile
+                for (auto* resource : {one.p, two.p}) {
+                    EXPECT(resource != nullptr);
+                    UINT tiles = 0;
+                    device->GetResourceTiling(resource, &tiles, nullptr, nullptr, nullptr, 0, nullptr);
+                    EXPECT(tiles == 1);  // 8x8 RGBA8: one packed tile
+                }
             }
 
             // Tiling: a resource that is not reserved has none, as on the PC runtime; a first index past the end
