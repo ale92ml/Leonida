@@ -3279,11 +3279,13 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   while a query with those counters is active (`VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076`), and the heap's
   pool has all eleven. So a statistics query that holds a mesh draw is split as above, and a split before a draw stays
   outside its rendering scope. A segment's first draw decides its pool: the submission's full pool, or a second pool
-  with only clipping invocations and primitives, fragment and compute invocations. A later draw of the other kind ends
-  the segment and begins one of its own kind; dispatches and segments without draws use the full pool, and
-  `ExecuteIndirect` draws count as vertex draws. The sum copies a mesh segment's four counters into fields 5 to 8 of
-  its record, and `statistics_sum.comp` adds them as `CInvocations`, `CPrimitives`, `PSInvocations` and
-  `CSInvocations`, so the other fields get nothing from it. A query that holds only mesh draws is one mesh segment,
+  with only fragment and compute invocations. Vulkan also forbids both clipping counters during mesh draws. A later
+  draw of the other kind ends the segment and begins one of its own kind. Segments without draws use the full pool, and
+  `ExecuteIndirect` draws count as vertex draws. The sum copies a mesh segment's two counters into slots 7 and 8 of
+  its scratch record. `statistics_sum.comp` adds them to `PSInvocations` and `CSInvocations`.
+  Mesh clipping remains a compatibility gap. Native D3D12 on an RTX 4090 reported four clipping invocations and
+  four primitives for four in-frustum mesh triangles. The Vulkan path reports only clipping from vertex segments.
+  A query that holds only mesh draws is one mesh segment,
   resolved through the same sum. Without the compute helper there is no segment pool and such a list is refused
   (`unsupported`) rather than run unsplit; so is one on the single-list `replay()` (D3D-399), whose
   `create_segment_pool` gives no mesh pool. Overlapping statistics queries (D3D-252) split the same way inside their
@@ -3291,8 +3293,7 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   belongs to sums both kinds. `replay_query_predication_test` (cases 15 and 16) checks the split points, the segment
   kinds and the resolve plan on the CPU. `d3d12_mesh_test` resolves a query around a vertex, two mesh and a vertex
   draw, one around a mesh draw and one around the two vertex draws: the vertex fields count only the two triangles,
-  and the mixed query has more clipping and pixel-shader invocations than the vertex-only one. On the RX 9060 XT
-  (RADV), the clipping counts add up exactly (2 + 10 = 12).
+  and the mixed query retains the vertex clipping counts and has more pixel-shader invocations than the vertex-only one.
 - **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
   shares one `VkQueue` for now (question 12), so they share one frequency.
 - **Timestamp resolves on MoltenVK.** On Apple GPUs, MoltenVK delays every `vkCmdWriteTimestamp` to the end of

@@ -2344,8 +2344,8 @@ inline ReplayResult plan_occlusion_segments(PreparedList& out) {
 // Helper dispatches must not contribute to the application's CSInvocations (D3D-162). Query resolves and
 // ordinary helper commands share one sequence of physical statistics segments. Resolve dispatch requirements
 // depend on heap state at planning time, so every non-timestamp resolve splits conservatively.
-// A mesh draw cannot run while a query with the input-assembly, vertex, geometry or tessellation counters is active
-// (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076), though D3D12 allows it and reads those fields as 0. A query
+// A mesh draw cannot run while a query with input-assembly, vertex, geometry, clipping or tessellation counters
+// is active (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076). A query
 // that holds a mesh draw is split as well (D3D-291): a segment's first draw decides whether it runs in the full pool
 // or in the mesh one (statistics_mesh), and a later draw of the other kind ends it and begins one of its own kind.
 // Dispatches and segments without draws use the full pool; ExecuteIndirect draws count as vertex draws. Each draw
@@ -3243,7 +3243,7 @@ public:
                         const auto& saved = value.occlusion;
                         const std::uint8_t* kinds = saved.segments->mesh.empty() ? nullptr
                                                                                  : saved.segments->mesh.data();
-                        // A mesh segment's four counters go through the sum to land in their D3D12 fields.
+                        // The mesh segment's compact counters go through the sum to land in their D3D12 fields.
                         const bool any_mesh = kinds && std::find(kinds + saved.first, kinds + saved.first + saved.count,
                                                                  std::uint8_t(1)) != kinds + saved.first + saved.count;
                         run = {saved.segments->pool, saved.first, saved.count, run.offset,
