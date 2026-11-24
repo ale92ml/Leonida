@@ -104,6 +104,39 @@ class Harness(unittest.TestCase):
         self.assertTrue(any(not r["agree"] for r in compared),
                         "writing the high half of the saved EXEC has to change the 64-lane run")
 
+    def test_every_mutation_combination_builds(self):
+        """Generation must never raise: a batch that dies halfway reports nothing about the analysis and silently
+        shrinks the sample. `derive_none` empties the vote prefix, and a `derive_*` mutation drawn after it used to
+        assign into the empty list - IndexError, and two campaign lots of 250 programs each were lost to it before
+        anyone noticed the reports were missing rather than clean."""
+        bad = []
+        for mode in diff.MODES:
+            for seed in range(12):
+                for i in range(25):
+                    try:
+                        diff.one_program(mode, seed, i, 3)
+                    except Exception as exc:                # noqa: BLE001 - that is the point of the test
+                        bad.append(f"{mode} seed {seed} #{i}: {type(exc).__name__}: {exc}")
+        self.assertEqual(bad[:5], [], f"{len(bad)} of {len(diff.MODES) * 12 * 25} programs failed to build")
+
+    def test_a_generator_failure_is_reported_and_not_fatal(self):
+        """And if one ever raises again, `check` has to turn it into a harness error the batch counts and the exit
+        status reflects, instead of taking the process down."""
+        def boom(*args, **kwargs):
+            raise RuntimeError("generator broke")
+
+        original = diff.one_program
+        try:
+            diff.one_program = boom
+            results = diff.run_batch("vote", 1, 3, 3)
+        finally:
+            diff.one_program = original
+        counts = diff.summarise(results)
+        self.assertEqual(counts["programs"], 3)
+        self.assertEqual(counts["compared"], 0)
+        self.assertEqual(sum(counts["harness"].values()), 3)
+        self.assertIn("RuntimeError: generator broke", counts["harness"])
+
     def test_generation_is_deterministic(self):
         for mode in diff.MODES:
             with self.subTest(mode=mode):
