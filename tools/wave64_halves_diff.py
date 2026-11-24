@@ -15,11 +15,29 @@ the wave interpreter decides it both ways:
   * tier C and the two cuts agree       -> a false negative (coverage given up; not an error, but reported).
 
 Programs are generated, never read from a shader: `tools/cf_diff.py` supplies the RDNA2 control-flow shapes, this
-file adds the wave64 vertex-shader frame, the cross-lane idiom fragments that `cf_diff` never emits (so tier B is
-reached at all), and a mutational generator around the pixel-kill early exit. No game data is involved; nothing is
-read from disk but the temporary listing each program is written to.
+file adds the wave64 frame of a vertex and of a pixel shader, the cross-lane idiom fragments that `cf_diff` never
+emits (so tier B is reached at all), and a mutational generator around the pixel-kill early exit. No game data is
+involved; nothing is read from disk but the temporary listing each program is written to.
+
+The six modes, three per stage:
+
+    flow / ps              cf_diff's control-flow shapes through that stage's frame
+    idioms / ps_idioms     the same with cross-lane fragments spliced in, which is the only way tier B is
+                           generated: cf_diff emits no readfirstlane, readlane, writelane, waterfall, swizzle or
+                           permlane, so without them the one tier that needs a rewrite never appears
+    kill / ps_kill         one or two mutations of the pixel-kill shape the test suite asserts is tier A, so
+                           samples land on the boundary of kill_vote / inert_exit / confined / vm_export_before
+
+The pixel modes matter out of proportion to their number: 12,101 of the corpus's 13,405 wave64 graphics shaders
+are pixel shaders and 8,585 of its 9,287 tier C, and the quad rules, the helper lanes and the `exp ... vm` that
+decides a pixel's fate exist in no other stage.
 
 Exit status: 0 clean, 1 a tier-A/B divergence, 2 nothing was compared.
+
+A program the two cuts cannot both run is reported as a skip, not a pass. The common ones are honest: a tier-C
+`v_readlane_b32` past lane 31 makes the interpreter refuse the 32-lane run ("Shuffle from invocation 40, which is
+not run"), which is the undefined result a 32-wide GPU would give; a generated loop can outrun the step limit; and
+on a branch without the SOPC inequality mnemonic the translator refuses `s_cmp_ne_u32`.
 
 Two traps a fragment must avoid, both of which produced false findings before they were fixed, and both covered by
 tests/semantic/test_wave64_halves_diff.py:
@@ -48,7 +66,19 @@ for _p in (HERE, SEM_DIR):
 import cf_diff  # noqa: E402
 from spirv_wave_interp import UnsupportedConstruct, run_wave  # noqa: E402
 
-MODES = ("flow", "idioms", "kill")
+MODES = ("flow", "idioms", "kill", "ps", "ps_idioms", "ps_kill")
+PS_MODES = ("ps", "ps_idioms", "ps_kill")
+
+# A pixel shader's per-lane value is the pixel it covers, not a lane id: interpolate attribute 0, scale it by the
+# 64x64 target of the ps_w64_* fixtures and pack it as p = y * 64 + x, the same number
+# tests/semantic/test_wave64_halves.py's _ps_xy derives from the 2x2 quad layout of fragment lanes. Both cuts then
+# shade the same pixels, so a difference between them is the analysis's business and not the frame's. v0 and v1
+# hold the barycentrics until the last interpolation has run, so p lands in v0 only afterwards.
+PS_PIXEL = ["v_interp_p1_f32_e32 v12, v0, attr0.x", "v_interp_p2_f32_e32 v12, v1, attr0.x",
+            "v_interp_p1_f32_e32 v13, v0, attr0.y", "v_interp_p2_f32_e32 v13, v1, attr0.y",
+            "v_mul_f32_e32 v12, 0x42800000, v12", "v_mul_f32_e32 v13, 0x42800000, v13",
+            "v_cvt_u32_f32_e32 v12, v12", "v_cvt_u32_f32_e32 v13, v13",
+            "v_lshl_add_u32 v0, v13, 6, v12"]
 
 # Scratch registers of the fragments and the kill shapes, kept clear of everything cf_diff allocates: s10-s13 and
 # the mask pairs at 20/40/50 + 2*depth are its, and so are v0-v11, so these start at s70 and v30.
@@ -83,8 +113,13 @@ class VsEmitter(cf_diff.Emitter):
     bodies compute on initialised, and an epilogue that exports both the per-lane and the scalar state so a
     difference in either shows up as a different word."""
 
+    pixel = False
+
     def program(self, body):
         self.ins("s_mov_b64 s[60:61], exec")        # a 64-bit op on EXEC: the translator reads the program wave64
+        if self.pixel:
+            for text in PS_PIXEL:
+                self.ins(text)
         self.ins("v_and_b32 v1, 7, v0")
         self.ins("v_lshrrev_b32 v2, 2, v0")
         self.ins("v_mul_lo_u32 v3, v0, 5")
@@ -108,9 +143,20 @@ class VsEmitter(cf_diff.Emitter):
         self.ins("v_xor_b32 v9, v6, v9")
         self.ins("v_lshlrev_b32 v9, 3, v9")
         self.ins("v_xor_b32 v9, v7, v9")
-        self.ins("exp pos0 v5, v5, v5, v5 done")
-        self.ins("exp param0 v8, v9, v10, v11")
+        if self.pixel:
+            self.ins("exp mrt0 v8, v9, v10, v11 done vm")
+        else:
+            self.ins("exp pos0 v5, v5, v5, v5 done")
+            self.ins("exp param0 v8, v9, v10, v11")
         self.ins("s_endpgm")
+
+
+class PsEmitter(VsEmitter):
+    """The same frame for a pixel shader: the per-lane value is the pixel the lane covers and the state leaves
+    through mrt0, so the quad rules and the helper lanes of a fragment wave are in play. 12,101 of the corpus's
+    13,405 wave64 graphics shaders are pixel shaders, and 8,585 of its 9,287 tier C."""
+
+    pixel = True
 
 
 def inject(rng, body, count):
@@ -142,12 +188,16 @@ def inject(rng, body, count):
 KILL_WORK = ("v_mul_u32_u24_e32 v6, 3, v0", "v_mov_b32_e32 v7, 1")
 
 
-def kill_base():
+def kill_base(pixel=False):
+    # A pixel shader's exit is the real thing the rule is named after: EXEC back to the live mask, a null export
+    # with `vm` so the pixels of an empty half are discarded, and nothing else.
+    exit_ = ["s_mov_b64 exec, s[20:21]", "exp null off, off, off, off done vm", "s_endpgm"] if pixel else \
+        ["s_mov_b64 exec, s[20:21]", "exp pos0 v5, v5, v5, v5 done", "s_endpgm"]
     return {"head": ["s_mov_b64 s[20:21], exec", "v_cmp_gt_u32_e32 vcc, 40, v0",
                      "s_andn2_b64 s[20:21], s[20:21], vcc"],
             "vote": "s_cbranch_scc0",
             "run": ["s_wqm_b64 s[22:23], s[20:21]", "s_and_b64 exec, exec, s[22:23]"] + list(KILL_WORK),
-            "exit": ["s_mov_b64 exec, s[20:21]", "exp pos0 v5, v5, v5, v5 done", "s_endpgm"]}
+            "exit": exit_}
 
 
 def _set(key, index, text):
@@ -231,17 +281,23 @@ def _size(text):
     return lines.assemble()[0][1]
 
 
-def kill_lines(rng):
+PS_ONLY_SKIP = {"exit_param"}          # `exp param0` is not a pixel-shader export
+
+
+def kill_lines(rng, pixel=False):
     """A mutated pixel-kill shape as a raw instruction listing, and the names of the mutations applied."""
-    p, names = kill_base(), []
+    p, names = kill_base(pixel), []
+    choices = [m for m in KILL_MUTATIONS if not (pixel and m[0] in PS_ONLY_SKIP)]
     for _ in range(rng.randrange(1, 3)):
-        name, fn = rng.choice(KILL_MUTATIONS)
+        name, fn = rng.choice(choices)
         fn(p, rng)
         names.append(name)
-    tail = p["run"] + ["v_mov_b32_e32 v5, 0", "exp pos0 v5, v5, v5, v5 done",
-                       "exp param0 v6, v7, v5, v5", "s_endpgm"]
+    epilogue = ["exp mrt0 v6, v7, v5, v5 done vm", "s_endpgm"] if pixel else \
+        ["v_mov_b32_e32 v5, 0", "exp pos0 v5, v5, v5, v5 done", "exp param0 v6, v7, v5, v5", "s_endpgm"]
+    tail = p["run"] + epilogue
     hop = sum(_size(t) for t in tail) // 4
-    body = ["s_mov_b64 s[10:11], exec", "v_mov_b32_e32 v6, 0", "v_mov_b32_e32 v7, 0", "v_mov_b32_e32 v5, 0"] + \
+    body = ["s_mov_b64 s[10:11], exec"] + (list(PS_PIXEL) if pixel else []) + \
+        ["v_mov_b32_e32 v6, 0", "v_mov_b32_e32 v7, 0", "v_mov_b32_e32 v5, 0"] + \
         p["head"] + [f"{p['vote']} {hop}"] + tail + p["exit"]
     return names, [(text, _size(text)) for text in body]
 
@@ -286,15 +342,38 @@ def run_cut(spv, wave):
     return out
 
 
+def ps_xy(lane):
+    """The pixel of a fragment lane on an 8x8 tile: lane 4q+c is the quad's top-left, top-right, bottom-left,
+    bottom-right (the same layout as `_ps_xy` in tests/semantic/test_wave64_halves.py)."""
+    q, c = divmod(lane, 4)
+    return 2 * (q % 4) + (c & 1), 2 * (q // 4) + (c >> 1)
+
+
+def run_cut_ps(spv, wave):
+    """The same for a pixel shader: attribute 0 carries the pixel's centre on a 64x64 target, so each cut shades
+    the same pixels, and the words come from mrt0. A lane the shader killed exports nothing and stays None."""
+    out = []
+    for half in range(64 // wave):
+        base = half * wave
+        res = run_wave(spv, wave=wave,
+                       inputs={0: lambda lane, b=base: ((ps_xy(b + lane)[0] + 0.5) / 64.0,
+                                                        (ps_xy(b + lane)[1] + 0.5) / 64.0, 0.0, 0.0)})
+        for o in res["outputs"]:
+            words = dict(o) if o else {}
+            out.append(next((v for key, v in words.items() if key.endswith("mrt0")), None))
+    return out
+
+
 def one_program(mode, seed, index, depth):
     """(label, listing) of program `index` of a batch: deterministic in (mode, seed, index, depth)."""
     rng = random.Random(f"{mode}:{seed}:{index}")
-    if mode == "kill":
-        names, lines = kill_lines(rng)
+    pixel = mode in PS_MODES
+    if mode in ("kill", "ps_kill"):
+        names, lines = kill_lines(rng, pixel)
         return ",".join(names), lines
     body = cf_diff.generate(rng, 64, max_depth=depth, budget=rng.randrange(3, 11))
-    used = inject(rng, body, rng.randrange(1, 4)) if mode == "idioms" else []
-    emitter = VsEmitter(64)
+    used = inject(rng, body, rng.randrange(1, 4)) if mode in ("idioms", "ps_idioms") else []
+    emitter = (PsEmitter if pixel else VsEmitter)(64)
     emitter.program(body)
     return ",".join(used), emitter.assemble()
 
@@ -302,7 +381,9 @@ def one_program(mode, seed, index, depth):
 def check(mode, seed, index, depth):
     """One program's verdict: a dict with its tier, reasons and whether the two cuts agree."""
     label, lines = one_program(mode, seed, index, depth)
-    name = f"vs_w64d_{mode}_{seed}_{index:05d}"
+    pixel = mode in PS_MODES
+    cut = run_cut_ps if pixel else run_cut
+    name = f"{'ps' if pixel else 'vs'}_w64d_{mode}_{seed}_{index:05d}"
     spv, verdict = translate(name, lines)
     if spv is None:
         return {"name": name, "label": label, "skip": verdict}
@@ -311,7 +392,7 @@ def check(mode, seed, index, depth):
     out = {"name": name, "label": label, "tier": verdict["tier"],
            "reasons": sorted(verdict["reasons"]), "idioms": sorted(verdict["idioms"])}
     try:
-        whole, halves = run_cut(spv, 64), run_cut(spv, 32)
+        whole, halves = cut(spv, 64), cut(spv, 32)
     except UnsupportedConstruct as e:
         out["skip"] = f"wave interp: {e}"
         return out
@@ -392,7 +473,7 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=1, help="batch seed; the batch is deterministic in it")
     p.add_argument("--depth", type=int, default=3, help="maximum control-flow nesting of a generated body")
     p.add_argument("--mode", choices=MODES + ("all",), default="all",
-                   help="flow: cf_diff control flow; idioms: with cross-lane fragments; kill: pixel-kill shapes")
+                   help="flow/idioms/kill run a vertex frame, ps/ps_idioms/ps_kill a pixel one; idioms splices in the cross-lane fragments, kill mutates the pixel-kill shape")
     p.add_argument("--report", help="write the counts to this JSON file")
     p.add_argument("--verbose", action="store_true", help="print every program's tier")
     p.add_argument("--self-test", action="store_true", help="check the harness itself and exit")

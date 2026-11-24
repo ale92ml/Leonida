@@ -111,18 +111,35 @@ class Harness(unittest.TestCase):
                 self.assertNotEqual(diff.one_program(mode, 3, 7, 3), diff.one_program(mode, 3, 8, 3))
 
     def test_each_mode_reaches_the_tier_it_is_there_for(self):
-        """A batch that is all tier C proves nothing: the oracle only bites on tier A or B. `flow` and `kill`
-        reach tier A, and `idioms` is the mode that reaches tier B at all - cf_diff emits no cross-lane
-        instruction, so without the fragments the one tier that needs a rewrite is never generated."""
-        for mode, want in (("flow", "A"), ("kill", "A"), ("idioms", "B")):
+        """A batch that is all tier C proves nothing: the oracle only bites on tier A or B. The flow and kill
+        modes reach tier A, and the idiom modes are the ones that reach tier B at all - cf_diff emits no
+        cross-lane instruction, so without the fragments the one tier that needs a rewrite is never generated."""
+        for mode, want in (("flow", "A"), ("kill", "A"), ("idioms", "B"),
+                           ("ps", "A"), ("ps_kill", "A"), ("ps_idioms", "B")):
             with self.subTest(mode=mode):
-                tiers = [diff.check(mode, 2, i, 3).get("tier") for i in range(12)]
+                tiers = [diff.check(mode, 2, i, 3).get("tier") for i in range(14)]
                 self.assertIn(want, tiers, f"{mode}: no tier {want} in {tiers}")
+
+    def test_a_pixel_program_shades_the_pixels_its_lane_covers(self):
+        """The pixel frame has to put the same pixel in the same lane in both cuts, or every pixel-mode result
+        would be about the frame. A per-lane program's words are 3 * (y * 64 + x) of this lane's pixel in the 2x2
+        quad layout, in one 64-lane wave and in two of 32 alike."""
+        lines = [(text, diff._size(text)) for text in
+                 ["s_mov_b64 s[60:61], exec"] + list(diff.PS_PIXEL) +
+                 ["v_mov_b32_e32 v7, 1", "v_mul_u32_u24_e32 v6, 3, v0", "v_mov_b32_e32 v5, 0",
+                  "exp mrt0 v6, v7, v5, v5 done vm", "s_endpgm"]]
+        spv, verdict = diff.translate("ps_w64d_frame", lines)
+        self.assertIsNotNone(spv, verdict)
+        self.assertEqual(verdict["tier"], "A", verdict)
+        whole, halves = diff.run_cut_ps(spv, 64), diff.run_cut_ps(spv, 32)
+        self.assertEqual(whole, halves)
+        want = [(3 * (diff.ps_xy(k)[1] * 64 + diff.ps_xy(k)[0]), 1) for k in range(64)]
+        self.assertEqual([None if w is None else tuple(w[:2]) for w in whole], want)
 
     def test_a_small_fixed_seed_batch_has_no_tier_a_or_b_divergence(self):
         for mode in diff.MODES:
             with self.subTest(mode=mode):
-                counts = diff.summarise(diff.run_batch(mode, 4, 5, 3))
+                counts = diff.summarise(diff.run_batch(mode, 4, 4, 3))
                 self.assertGreater(counts["compared"], 0, f"{mode}: nothing was compared")
                 self.assertEqual(counts["unsound"], 0, f"{mode}: a tier A/B program diverged")
 
